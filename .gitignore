@@ -1,0 +1,14 @@
+.DS_Store
+/build/
+/vendor/
+
+# Local release artifacts and generated media
+*.dmg
+*.zip
+*.wav
+*.m4a
+*.mp3
+*.mp4
+*.mov
+*.srt
+*.vtt
