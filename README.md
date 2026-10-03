@@ -1,7 +1,5 @@
 # Speaker Marks for macOS
 
-![Speaker Marks app icon](Assets/AppIcon.png)
-
 A native Apple Silicon macOS app for on-device transcription. Choose a Whisper model, transcribe audio or video formats supported by FFmpeg, watch the transcript appear as it is recognized, and save `.txt`, `.srt`, and `.vtt` files beside the input. Optional speaker detection runs locally and adds editable speaker names to the transcript and subtitle exports.
 
 ## Open the app
