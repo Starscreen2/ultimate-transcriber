@@ -1,6 +1,6 @@
 # Third-party notices
 
-Speaker Marks uses or can download software and model files maintained by third parties. Their names and marks belong to their respective owners. This project is not affiliated with those upstream projects.
+Ultimate Transcriber uses or can download software and model files maintained by third parties. Their names and marks belong to their respective owners. This project is not affiliated with those upstream projects.
 
 ## Software built into the macOS app
 

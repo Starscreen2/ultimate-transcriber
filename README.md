@@ -1,6 +1,6 @@
-# Speaker Marks for macOS
+# Ultimate Transcriber
 
-A native Apple Silicon macOS app for on-device transcription. Choose a Whisper model, transcribe audio or video formats supported by FFmpeg, watch the transcript appear as it is recognized, and save `.txt`, `.srt`, and `.vtt` files beside the input. Optional speaker detection runs locally and adds editable speaker names to the transcript and subtitle exports.
+I built Ultimate Transcriber to transcribe audio and video locally on my Mac. It uses Whisper, shows the transcript as it is recognized, and can label speakers so I can rename them later. I can export the result as `.txt`, `.srt`, or `.vtt`. The recordings stay on the Mac; model files are downloaded from their upstream sources when needed.
 
 ## Open the app
 
@@ -30,4 +30,4 @@ The build requires Xcode Command Line Tools, CMake, Git, and Homebrew FFmpeg. Th
 
 ## Credits and license
 
-Speaker Marks is released under the MIT License; see [`LICENSE`](LICENSE). It builds on [whisper.cpp](https://github.com/ggml-org/whisper.cpp) (MIT) and [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) (Apache-2.0). Their license texts are included in [`ThirdPartyLicenses/`](ThirdPartyLicenses/), and the build script copies them into the app bundle. FFmpeg is installed separately and is not bundled. Model files are downloaded from their upstream sources and carry their own licenses and access terms. See [`ThirdPartyNotices.md`](ThirdPartyNotices.md) for details.
+Ultimate Transcriber is released under the MIT License; see [`LICENSE`](LICENSE). It uses [whisper.cpp](https://github.com/ggml-org/whisper.cpp) (MIT) and [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) (Apache-2.0). Their license texts are included in [`ThirdPartyLicenses/`](ThirdPartyLicenses/) and copied into the app bundle by the build script. FFmpeg is installed separately. Downloaded model files have their own licenses and access terms; see [`ThirdPartyNotices.md`](ThirdPartyNotices.md).
