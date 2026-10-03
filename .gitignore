@@ -1,6 +1,7 @@
 .DS_Store
 /build/
 /vendor/
+__pycache__/
 
 # Local release artifacts and generated media
 *.dmg
