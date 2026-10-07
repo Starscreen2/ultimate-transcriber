@@ -172,6 +172,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
     private let systemAudioCaptureToggle = NSButton(checkboxWithTitle: "System Audio", target: nil, action: nil)
     private let meetingSettingsNote = NSTextField(wrappingLabelWithString: "")
     private var meetingSettingsWindow: NSWindow?
+    private let detectionModePicker = NSPopUpButton(frame: .zero, pullsDown: false)
+    private var detectionPlatformToggles: [MeetingPlatform: NSButton] = [:]
+    private let detectionSettingsStatus = NSTextField(wrappingLabelWithString: "")
+    private let detectionAccessibilityButton = NSButton(title: "Allow meeting detection access…", target: nil, action: nil)
+    private let detectionPreviewButton = NSButton(title: "Preview reminder", target: nil, action: nil)
+    private let detectionAddAppButton = NSButton(title: "Add another app…", target: nil, action: nil)
+    private let detectionAddSiteButton = NSButton(title: "Add meeting website…", target: nil, action: nil)
+    private let detectionClearSourcesButton = NSButton(title: "Clear added apps / sites", target: nil, action: nil)
+    private let detectionAddedSourcesLabel = NSTextField(wrappingLabelWithString: "")
+    private let detectionFolderButton = NSButton(title: "Choose recordings folder…", target: nil, action: nil)
+    private let detectionModelButton = NSButton(title: "Download meeting model", target: nil, action: nil)
+    private let meetingDetector = MeetingDetector()
+    private var detectionTracker = MeetingDetectionTracker()
+    private var openingTracker = MeetingOpeningTracker()
+    private var detectionSnapshot: MeetingDetectionSnapshot?
+    private var detectionPanel: NSPanel?
+    private var promptedMeeting: MeetingEvidence?
+    private var promptedOpening: MeetingOpening?
+    private var lastOpeningReminder: MeetingOpening?
     private let speakerToggle = NSButton(checkboxWithTitle: "Detect speakers", target: nil, action: nil)
     private let speakerEditors = NSStackView()
     private var selectedFile: URL?
@@ -182,6 +201,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
     private var activeSummaryOperation: OperationControl?
     private var meetingStatusItem: NSStatusItem?
     private let meetingController = MeetingCaptureController()
+    private var activeMeetingSessionID = UUID()
     private var waitingForMeetingStopBeforeQuit = false
     private var waitingForMeetingNotesBeforeQuit = false
     private var waitingForOperationBeforeQuit = false
@@ -227,14 +247,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        configureApplicationMenu()
         buildWindow()
         configureMeetingBadge()
+        configureMeetingDetection()
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        meetingDetector.stop()
+        closeDetectionPrompt()
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
 
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows: Bool) -> Bool {
+        openAppFromBadge()
+        return true
+    }
+
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         if waitingForMeetingStopBeforeQuit || waitingForOperationBeforeQuit { return .terminateLater }
+        closeDetectionPrompt()
         if let operation = activeOperation ?? activeSummaryOperation {
             waitingForOperationBeforeQuit = true
             operation.cancel()
@@ -242,7 +275,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
             updateMeetingBadgeMenu()
             return .terminateLater
         }
-        guard meetingController.inProgress else { return .terminateNow }
+        guard meetingController.inProgress else {
+            guard InferenceJobQueue.shared.isBusy else { return .terminateNow }
+            waitingForOperationBeforeQuit = true
+            return .terminateLater
+        }
         waitingForMeetingStopBeforeQuit = true
         meetingIsStopping = true
         updateMeetingBadgeMenu()
@@ -261,6 +298,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
 
     private var isTerminating: Bool {
         waitingForOperationBeforeQuit || waitingForMeetingStopBeforeQuit
+    }
+
+    private func replyToQuitWhenInferenceIsDone() {
+        if InferenceJobQueue.shared.isBusy {
+            waitingForOperationBeforeQuit = true
+        } else {
+            NSApp.reply(toApplicationShouldTerminate: true)
+        }
     }
 
     private func clearMeetingNotes() {
@@ -296,27 +341,56 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
     }
 
     private func configureMeetingBadge() {
+        InferenceJobQueue.shared.onIdle = { [weak self] in
+            guard let self, self.waitingForOperationBeforeQuit,
+                  !InferenceJobQueue.shared.isBusy, self.activeOperation == nil,
+                  self.activeSummaryOperation == nil, !self.meetingController.inProgress else { return }
+            self.waitingForOperationBeforeQuit = false
+            NSApp.reply(toApplicationShouldTerminate: true)
+        }
         meetingStatusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         meetingStatusItem?.button?.image = NSImage(systemSymbolName: "waveform", accessibilityDescription: "Meeting Capture")
         meetingStatusItem?.button?.toolTip = "Meeting Capture"
         updateMeetingBadgeMenu()
 
-        meetingController.onStatus = { [weak self] message in
-            DispatchQueue.main.async { self?.status.stringValue = message }
-        }
-        meetingController.onStateChange = { [weak self] active in
+        meetingController.onStatus = { [weak self] sessionID, message in
             DispatchQueue.main.async {
-                guard let self else { return }
+                guard let self, self.activeMeetingSessionID == sessionID, self.activeOperation == nil else { return }
+                self.status.stringValue = message.isEmpty ? "Recording and transcribing the meeting locally…" : message
+            }
+        }
+        meetingController.onStateChange = { [weak self] sessionID, active in
+            DispatchQueue.main.async {
+                guard let self, self.activeMeetingSessionID == sessionID else { return }
+                // A stopped session is still finishing until its result or
+                // failure reaches the window. Keep the current UI state so a
+                // new session cannot start ahead of the previous callback.
+                if !active {
+                    self.updateMeetingBadgeMenu()
+                    self.updateMeetingCaptureControls()
+                    return
+                }
                 self.meetingIsPreparing = false
-                self.meetingIsActive = active
+                self.meetingIsActive = true
                 self.meetingIsStopping = false
                 self.updateMeetingBadgeMenu()
                 self.updateMeetingCaptureControls()
             }
         }
-        meetingController.onLiveSegments = { [weak self] segments in
+        meetingController.onCaptureStopped = { [weak self] sessionID in
             DispatchQueue.main.async {
-                guard let self else { return }
+                guard let self, self.activeMeetingSessionID == sessionID else { return }
+                self.meetingIsPreparing = false
+                self.meetingIsActive = false
+                self.meetingIsStopping = false
+                self.status.stringValue = "Recording saved. Finishing its transcript in the background…"
+                self.updateMeetingBadgeMenu()
+                self.updateMeetingCaptureControls()
+            }
+        }
+        meetingController.onLiveSegments = { [weak self] sessionID, segments in
+            DispatchQueue.main.async {
+                guard let self, self.activeMeetingSessionID == sessionID else { return }
                 self.transcriptSegments = segments
                 self.transcript.string = Self.renderTranscript(segments, names: [:])
                 self.transcript.textColor = .labelColor
@@ -326,7 +400,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
         }
         meetingController.onFinished = { [weak self] result in
             DispatchQueue.main.async {
-                guard let self else { return }
+                guard let self, self.activeMeetingSessionID == result.sessionID else { return }
+                self.meetingIsPreparing = false
+                self.meetingIsActive = false
+                self.meetingIsStopping = false
                 self.meetingResult = result
                 self.resultFolder = result.folder
                 self.outputBase = result.transcriptBase
@@ -355,13 +432,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
                 }
                 if self.waitingForMeetingStopBeforeQuit && !self.waitingForMeetingNotesBeforeQuit {
                     self.waitingForMeetingStopBeforeQuit = false
-                    NSApp.reply(toApplicationShouldTerminate: true)
+                    self.replyToQuitWhenInferenceIsDone()
                 }
             }
         }
-        meetingController.onFailure = { [weak self] message, preservedFolder in
+        meetingController.onFailure = { [weak self] sessionID, message, preservedFolder in
             DispatchQueue.main.async {
-                guard let self else { return }
+                guard let self, self.activeMeetingSessionID == sessionID else { return }
                 self.meetingIsPreparing = false
                 self.meetingIsActive = false
                 self.meetingIsStopping = false
@@ -374,19 +451,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
                 self.updateMeetingCaptureControls()
                 if self.waitingForMeetingStopBeforeQuit {
                     self.waitingForMeetingStopBeforeQuit = false
-                    NSApp.reply(toApplicationShouldTerminate: true)
+                    self.replyToQuitWhenInferenceIsDone()
                 }
             }
         }
     }
 
     private func updateMeetingBadgeMenu() {
+        let recording = meetingIsActive && !meetingIsStopping
+        meetingStatusItem?.button?.image = NSImage(systemSymbolName: recording ? "record.circle.fill" : "waveform",
+                                                  accessibilityDescription: recording ? "Meeting recording in progress" : "Meeting Capture")
+        meetingStatusItem?.button?.contentTintColor = recording ? .systemRed : nil
+        meetingStatusItem?.button?.toolTip = recording ? "Recording and transcribing — click to stop" : "Meeting Capture"
         let menu = NSMenu()
         menu.autoenablesItems = false
         let startTitle = meetingIsPreparing ? "Preparing Meeting…" : "Start Meeting"
         let start = NSMenuItem(title: startTitle, action: #selector(startMeetingFromBadge), keyEquivalent: "")
         start.target = self
-        start.isEnabled = !meetingInProgress && !isBusy && !isTerminating
+        start.isEnabled = !meetingInProgress && (!isBusy || busyKind == .transcription) && !isTerminating
         menu.addItem(start)
 
         let stop = NSMenuItem(title: meetingIsStopping ? "Finishing Meeting…" : "Stop Meeting",
@@ -412,6 +494,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
         let settings = NSMenuItem(title: "Meeting Settings…", action: #selector(openMeetingSettings), keyEquivalent: "")
         settings.target = self
         menu.addItem(settings)
+        let detection = NSMenuItem(title: "Meeting detection: \(detectionMode.title)", action: nil, keyEquivalent: "")
+        let modes = NSMenu()
+        for (index, mode) in MeetingDetectionMode.allCases.enumerated() {
+            let item = NSMenuItem(title: mode.title, action: #selector(detectionModeFromMenu(_:)), keyEquivalent: "")
+            item.target = self
+            item.tag = index
+            item.state = detectionMode == mode ? .on : .off
+            item.isEnabled = mode != .automatic || MeetingDetector.supported
+            modes.addItem(item)
+        }
+        detection.submenu = modes
+        menu.addItem(detection)
         menu.addItem(.separator())
         let quit = NSMenuItem(title: "Quit Transcribe to Text", action: #selector(quitFromBadge), keyEquivalent: "q")
         quit.target = self
@@ -420,7 +514,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
     }
 
     @objc private func startMeetingFromBadge() {
-        guard !meetingInProgress, !isBusy, !isTerminating else { return }
+        guard !meetingInProgress, (!isBusy || busyKind == .transcription), !isTerminating else { return }
+        closeDetectionPrompt()
         guard meetingMicrophoneEnabled || (meetingSystemAudioEnabled && supportsSystemAudioCapture) else {
             status.stringValue = "Turn on at least one available audio source in Meeting Settings."
             openAppFromBadge()
@@ -444,7 +539,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
         }
     }
 
-    private func beginMeeting(at folder: URL) {
+    private func beginMeeting(at folder: URL, detectedMeeting: MeetingEvidence? = nil) {
+        detectionTracker.claimAll()
+        openingTracker.claimAll()
+        closeDetectionPrompt()
         meetingIsPreparing = true
         clearMeetingNotes()
         resultFolder = nil
@@ -463,15 +561,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
         status.stringValue = "Preparing the meeting session…"
         updateMeetingBadgeMenu()
         updateMeetingCaptureControls()
-        window.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
-        meetingController.start(meetingsRoot: folder,
+        if detectedMeeting == nil {
+            window.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+        }
+        let sessionID = UUID()
+        activeMeetingSessionID = sessionID
+        let liveTranscription = InferenceJobQueue.shared.tryAcquire()
+        if !liveTranscription {
+            status.stringValue = "Whisper is busy. Recording will start now, and its transcript will wait in the queue."
+        }
+        meetingController.start(sessionID: sessionID, liveTranscription: liveTranscription, meetingsRoot: folder,
                                 includeMicrophone: meetingMicrophoneEnabled,
-                                includeSystemAudio: meetingSystemAudioEnabled && supportsSystemAudioCapture)
+                                includeSystemAudio: meetingSystemAudioEnabled && supportsSystemAudioCapture,
+                                shouldBeginCapture: detectedMeeting.map { signal in
+                                    { [weak self] in
+                                        guard let delegate = self else { return false }
+                                        return await MainActor.run {
+                                            return delegate.detectionMode == .automatic && !delegate.isTerminating &&
+                                                delegate.enabledDetectionPlatforms.contains(signal.platform) &&
+                                                MeetingDetector.accessibilityAvailable &&
+                                                delegate.detectionTracker.canAutoStart(signal.key, now: ProcessInfo.processInfo.systemUptime)
+                                        }
+                                    }
+                                })
     }
 
     @objc private func stopMeetingFromBadge() {
         guard meetingInProgress, !meetingIsStopping else { return }
+        detectionTracker.claimAll()
+        openingTracker.claimAll()
         meetingIsStopping = true
         updateMeetingBadgeMenu()
         updateMeetingCaptureControls()
@@ -489,30 +608,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
 
     @objc private func openMeetingSettings() {
         if meetingSettingsWindow == nil {
-            let settingsWindow = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 470, height: 260),
-                                           styleMask: [.titled, .closable], backing: .buffered, defer: false)
+            let settingsWindow = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 580, height: 740),
+                                          styleMask: [.titled, .closable], backing: .buffered, defer: false)
             settingsWindow.title = "Meeting Settings"
             settingsWindow.isReleasedWhenClosed = false
             settingsWindow.center()
-
-            let title = NSTextField(labelWithString: "Meeting audio sources")
-            title.font = .boldSystemFont(ofSize: 17)
-            let intro = NSTextField(wrappingLabelWithString: "Choose which sources are used for new meeting sessions.")
-            intro.font = .systemFont(ofSize: 12)
-            intro.textColor = .secondaryLabelColor
-            let microphoneDetail = NSTextField(wrappingLabelWithString: "Records nearby voices through the Mac microphone.")
-            microphoneDetail.font = .systemFont(ofSize: 11)
-            microphoneDetail.textColor = .secondaryLabelColor
-            let systemAudioDetail = NSTextField(wrappingLabelWithString: "Captures sound playing through the Mac with an audio-only Core Audio tap. No screen video is captured.")
-            systemAudioDetail.font = .systemFont(ofSize: 11)
-            systemAudioDetail.textColor = .secondaryLabelColor
-            systemAudioDetail.maximumNumberOfLines = 2
-            systemAudioDetail.lineBreakMode = .byWordWrapping
-            meetingSettingsNote.font = .systemFont(ofSize: 11)
-            meetingSettingsNote.textColor = .secondaryLabelColor
-            meetingSettingsNote.maximumNumberOfLines = 2
-            meetingSettingsNote.lineBreakMode = .byWordWrapping
-
+            let title = NSTextField(labelWithString: "Meeting capture")
+            title.font = .boldSystemFont(ofSize: 19)
+            let intro = settingsLabel("Choose audio sources and how meetings start. Everything is processed on this Mac.")
             microphoneCaptureToggle.target = self
             microphoneCaptureToggle.action = #selector(meetingAudioSourceChanged(_:))
             microphoneCaptureToggle.tag = 1
@@ -520,46 +623,104 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
             systemAudioCaptureToggle.action = #selector(meetingAudioSourceChanged(_:))
             systemAudioCaptureToggle.tag = 2
             systemAudioCaptureToggle.isEnabled = supportsSystemAudioCapture
-            if supportsSystemAudioCapture {
-                meetingSettingsNote.stringValue = "These settings apply to meetings you start next. Capture and transcription stay on this Mac."
-            } else {
-                meetingSettingsNote.stringValue = "System audio capture requires macOS 14.2 or later. Microphone capture works on macOS 13 and later."
+            let microphoneDetail = settingsLabel("Records nearby voices through the microphone.")
+            let systemDetail = settingsLabel("Records audio playing on this Mac, including other apps. No screen video is recorded.")
+            let detectionTitle = NSTextField(labelWithString: "Meeting detection")
+            detectionTitle.font = .boldSystemFont(ofSize: 15)
+            detectionModePicker.addItems(withTitles: MeetingDetectionMode.allCases.map(\.title))
+            detectionModePicker.target = self
+            detectionModePicker.action = #selector(detectionModeChanged)
+            detectionModePicker.item(at: 2)?.isEnabled = MeetingDetector.supported
+            let platforms = NSStackView()
+            platforms.orientation = .vertical
+            platforms.alignment = .leading
+            platforms.spacing = 8
+            for index in stride(from: 0, to: MeetingPlatform.allCases.count, by: 3) {
+                let row = NSStackView()
+                row.orientation = .horizontal
+                row.spacing = 14
+                for platform in MeetingPlatform.allCases.dropFirst(index).prefix(3) {
+                    let toggle = NSButton(checkboxWithTitle: platform.title, target: self, action: #selector(detectionPlatformChanged(_:)))
+                    toggle.identifier = NSUserInterfaceItemIdentifier(platform.rawValue)
+                    detectionPlatformToggles[platform] = toggle
+                    row.addArrangedSubview(toggle)
+                }
+                platforms.addArrangedSubview(row)
             }
-
-            let content = NSView()
-            settingsWindow.contentView = content
-            [title, intro, microphoneCaptureToggle, microphoneDetail, systemAudioCaptureToggle,
-             systemAudioDetail, meetingSettingsNote].forEach {
-                content.addSubview($0)
-                $0.translatesAutoresizingMaskIntoConstraints = false
-            }
+            let detectionDetail = settingsLabel("Remind me shows a small banner when you open a selected video-call app or meeting website. Start, dismiss, or snooze it. One reminder per app launch; returning to an app does not keep repeating it.")
+            let compatibility = settingsLabel("Desktop app reminders need no extra permissions. Chat apps remind when opened, even without a call. Website reminders need Accessibility access and an exposed browser URL. Auto start is limited to Zoom, Teams and Google Meet with confirmed English call controls on macOS 14.2+. Other platforms show reminders. Stop recordings manually.")
+            detectionAddAppButton.target = self
+            detectionAddAppButton.action = #selector(addDetectionApplication)
+            detectionAddSiteButton.target = self
+            detectionAddSiteButton.action = #selector(addDetectionWebsite)
+            detectionClearSourcesButton.target = self
+            detectionClearSourcesButton.action = #selector(clearDetectionAdditionalSources)
+            detectionAddedSourcesLabel.font = .systemFont(ofSize: 11)
+            detectionAddedSourcesLabel.textColor = .secondaryLabelColor
+            let addSources = NSStackView(views: [detectionAddAppButton, detectionAddSiteButton])
+            addSources.orientation = .horizontal
+            addSources.spacing = 12
+            detectionAccessibilityButton.target = self
+            detectionAccessibilityButton.action = #selector(allowDetectionAccessibility)
+            detectionPreviewButton.target = self
+            detectionPreviewButton.action = #selector(previewDetectionReminder)
+            detectionFolderButton.target = self
+            detectionFolderButton.action = #selector(chooseMeetingRecordingsFolder)
+            detectionModelButton.target = self
+            detectionModelButton.action = #selector(downloadDetectionModel)
+            detectionSettingsStatus.font = .systemFont(ofSize: 11)
+            detectionSettingsStatus.textColor = .secondaryLabelColor
+            meetingSettingsNote.font = .systemFont(ofSize: 11)
+            meetingSettingsNote.textColor = .secondaryLabelColor
+            let stack = NSStackView(views: [title, intro, microphoneCaptureToggle, microphoneDetail,
+                                           systemAudioCaptureToggle, systemDetail, meetingSettingsNote,
+                                           detectionTitle, detectionModePicker, platforms, addSources,
+                                           detectionAddedSourcesLabel, detectionClearSourcesButton, detectionDetail,
+                                           compatibility, detectionPreviewButton, detectionAccessibilityButton, detectionFolderButton,
+                                           detectionModelButton, detectionSettingsStatus])
+            stack.orientation = .vertical
+            stack.alignment = .leading
+            stack.spacing = 9
+            stack.setCustomSpacing(18, after: meetingSettingsNote)
+            let scroll = NSScrollView()
+            scroll.hasVerticalScroller = true
+            scroll.autohidesScrollers = true
+            let content = MeetingSettingsDocumentView()
+            settingsWindow.contentView = scroll
+            scroll.documentView = content
+            content.translatesAutoresizingMaskIntoConstraints = false
+            content.addSubview(stack)
+            stack.translatesAutoresizingMaskIntoConstraints = false
             NSLayoutConstraint.activate([
-                title.leftAnchor.constraint(equalTo: content.leftAnchor, constant: 22),
-                title.topAnchor.constraint(equalTo: content.topAnchor, constant: 18),
-                intro.leftAnchor.constraint(equalTo: title.leftAnchor),
-                intro.rightAnchor.constraint(equalTo: content.rightAnchor, constant: -22),
-                intro.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 5),
-                microphoneCaptureToggle.leftAnchor.constraint(equalTo: title.leftAnchor),
-                microphoneCaptureToggle.topAnchor.constraint(equalTo: intro.bottomAnchor, constant: 15),
-                microphoneDetail.leftAnchor.constraint(equalTo: microphoneCaptureToggle.leftAnchor, constant: 22),
-                microphoneDetail.rightAnchor.constraint(equalTo: intro.rightAnchor),
-                microphoneDetail.topAnchor.constraint(equalTo: microphoneCaptureToggle.bottomAnchor, constant: 2),
-                systemAudioCaptureToggle.leftAnchor.constraint(equalTo: title.leftAnchor),
-                systemAudioCaptureToggle.topAnchor.constraint(equalTo: microphoneDetail.bottomAnchor, constant: 12),
-                systemAudioDetail.leftAnchor.constraint(equalTo: systemAudioCaptureToggle.leftAnchor, constant: 22),
-                systemAudioDetail.rightAnchor.constraint(equalTo: intro.rightAnchor),
-                systemAudioDetail.topAnchor.constraint(equalTo: systemAudioCaptureToggle.bottomAnchor, constant: 2),
-                meetingSettingsNote.leftAnchor.constraint(equalTo: title.leftAnchor),
-                meetingSettingsNote.rightAnchor.constraint(equalTo: intro.rightAnchor),
-                meetingSettingsNote.topAnchor.constraint(equalTo: systemAudioDetail.bottomAnchor, constant: 10),
+                stack.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 22),
+                stack.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -22),
+                stack.topAnchor.constraint(equalTo: content.topAnchor, constant: 20),
+                stack.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -20),
+                content.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor),
+                content.leadingAnchor.constraint(equalTo: scroll.contentView.leadingAnchor),
+                content.topAnchor.constraint(equalTo: scroll.contentView.topAnchor)
             ])
+            for label in [intro, microphoneDetail, systemDetail, meetingSettingsNote, detectionDetail,
+                          compatibility, detectionAddedSourcesLabel, detectionSettingsStatus] {
+                label.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+            }
             meetingSettingsWindow = settingsWindow
         }
-
         microphoneCaptureToggle.state = meetingMicrophoneEnabled ? .on : .off
         systemAudioCaptureToggle.state = supportsSystemAudioCapture && meetingSystemAudioEnabled ? .on : .off
+        meetingSettingsNote.stringValue = supportsSystemAudioCapture
+            ? "Audio settings apply to the next recording. macOS asks for access on first use; later meetings reuse your existing permissions."
+            : "System audio requires macOS 14.2+. Microphone recording works on macOS 13+."
+        refreshDetectionSettings()
         meetingSettingsWindow?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    private func settingsLabel(_ text: String) -> NSTextField {
+        let label = NSTextField(wrappingLabelWithString: text)
+        label.font = .systemFont(ofSize: 11)
+        label.textColor = .secondaryLabelColor
+        return label
     }
 
     @objc private func meetingAudioSourceChanged(_ sender: NSButton) {
@@ -571,6 +732,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
         meetingSettingsNote.stringValue = meetingMicrophoneEnabled || (meetingSystemAudioEnabled && supportsSystemAudioCapture)
             ? "These settings apply to meetings you start next. Capture and transcription stay on this Mac."
             : "Turn on at least one available audio source before starting a meeting."
+        refreshDetectionSettings()
     }
 
     @objc private func quitFromBadge() {
@@ -613,13 +775,55 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
                 self.waitingForMeetingNotesBeforeQuit = false
                 self.waitingForMeetingStopBeforeQuit = false
                 self.waitingForOperationBeforeQuit = false
-                NSApp.reply(toApplicationShouldTerminate: true)
+                self.replyToQuitWhenInferenceIsDone()
             }
         })
     }
 
     @objc private func openMeetingSummary() {
         if let summaryURL { NSWorkspace.shared.open(summaryURL) }
+    }
+
+    private func configureApplicationMenu() {
+        let main = NSMenu()
+        let appItem = NSMenuItem()
+        let appMenu = NSMenu(title: "Transcribe to Text")
+        appMenu.addItem(withTitle: "About Transcribe to Text", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
+        appMenu.addItem(.separator())
+        let settings = appMenu.addItem(withTitle: "Meeting Settings…", action: #selector(openMeetingSettings), keyEquivalent: ",")
+        settings.target = self
+        appMenu.addItem(.separator())
+        appMenu.addItem(withTitle: "Hide Transcribe to Text", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
+        let hideOthers = appMenu.addItem(withTitle: "Hide Others", action: #selector(NSApplication.hideOtherApplications(_:)), keyEquivalent: "h")
+        hideOthers.keyEquivalentModifierMask = [.command, .option]
+        appMenu.addItem(withTitle: "Show All", action: #selector(NSApplication.unhideAllApplications(_:)), keyEquivalent: "")
+        appMenu.addItem(.separator())
+        appMenu.addItem(withTitle: "Quit Transcribe to Text", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        appItem.submenu = appMenu
+        main.addItem(appItem)
+
+        let editItem = NSMenuItem()
+        let edit = NSMenu(title: "Edit")
+        edit.addItem(withTitle: "Undo", action: Selector(("undo:")), keyEquivalent: "z")
+        let redo = edit.addItem(withTitle: "Redo", action: Selector(("redo:")), keyEquivalent: "z")
+        redo.keyEquivalentModifierMask = [.command, .shift]
+        edit.addItem(.separator())
+        edit.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        edit.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        edit.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        edit.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        editItem.submenu = edit
+        main.addItem(editItem)
+
+        let windowItem = NSMenuItem()
+        let windowMenu = NSMenu(title: "Window")
+        windowMenu.addItem(withTitle: "Close", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
+        windowMenu.addItem(withTitle: "Minimize", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m")
+        windowMenu.addItem(withTitle: "Zoom", action: #selector(NSWindow.performZoom(_:)), keyEquivalent: "")
+        windowItem.submenu = windowMenu
+        main.addItem(windowItem)
+        NSApp.mainMenu = main
+        NSApp.windowsMenu = windowMenu
     }
 
     private func buildWindow() {
@@ -640,8 +844,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
         status.lineBreakMode = .byTruncatingTail
 
         WhisperModel.choices.forEach { modelPicker.addItem(withTitle: $0.title) }
-        modelPicker.selectItem(at: 6)
-        modelDetail.stringValue = WhisperModel.choices[6].detail + " First download is about 3 GB."
+        modelPicker.selectItem(at: 7)
+        modelDetail.stringValue = WhisperModel.choices[7].detail + " First download is about 1.6 GB."
         modelDetail.font = .systemFont(ofSize: 11)
         modelDetail.textColor = .secondaryLabelColor
         ["Auto detect", "English", "Spanish", "French", "German", "Chinese", "Japanese", "Korean", "Other…"]
@@ -672,7 +876,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
         meetingSettingsButton.bezelStyle = .rounded
         meetingSettingsButton.controlSize = .small
         downloadModelButton.target = self
-        downloadModelButton.action = #selector(downloadSelectedModel)
+        downloadModelButton.action = #selector(manageSelectedModel)
         downloadModelButton.bezelStyle = .rounded
         downloadModelButton.controlSize = .small
         showResultsButton.target = self
@@ -944,12 +1148,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
         if busyKind == .modelDownload {
             downloadModelButton.title = activeOperation?.isCancelled == true ? "Canceling…" : "Cancel Download"
             downloadModelButton.isEnabled = activeOperation?.isCancelled == false
+            downloadModelButton.toolTip = "Cancel the download of \(selected.id)."
         } else if WhisperModel.isInstalled(at: selected.localURL) {
-            downloadModelButton.title = "Model Downloaded"
-            downloadModelButton.isEnabled = false
+            downloadModelButton.title = "Delete Model"
+            downloadModelButton.isEnabled = activeOperation == nil && activeSummaryOperation == nil && !meetingInProgress && !isTerminating
+            downloadModelButton.toolTip = "Delete the downloaded \(selected.id) model from this Mac."
         } else {
             downloadModelButton.title = "Download Model (\(selected.downloadSize))"
             downloadModelButton.isEnabled = activeOperation == nil && activeSummaryOperation == nil && !meetingInProgress && !isTerminating
+            downloadModelButton.toolTip = "Download \(selected.id). Transcribe will also download it automatically if needed."
+        }
+    }
+
+    @objc private func manageSelectedModel() {
+        if busyKind == .modelDownload {
+            downloadSelectedModel()
+            return
+        }
+        guard activeOperation == nil, activeSummaryOperation == nil, !meetingInProgress, !isTerminating else { return }
+        let model = WhisperModel.choices[min(max(modelPicker.indexOfSelectedItem, 0), WhisperModel.choices.count - 1)]
+        guard WhisperModel.isInstalled(at: model.localURL) else {
+            downloadSelectedModel()
+            return
+        }
+
+        let alert = NSAlert()
+        alert.messageText = "Delete \(model.title.components(separatedBy: " · ").first ?? model.title)?"
+        alert.informativeText = "This removes the downloaded model (\(model.downloadSize)) from this Mac. You can download it again later."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Delete Model")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        do {
+            try FileManager.default.removeItem(at: model.localURL)
+            status.stringValue = "Deleted \(model.id). Download it again whenever you need it."
+            updateModelDownloadButton()
+        } catch {
+            status.stringValue = "Could not delete \(model.id): \(error.localizedDescription)"
         }
     }
 
@@ -1174,7 +1410,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
             }
         }
 
-        DispatchQueue.global(qos: .userInitiated).async {
+        let queuedBehindAnotherJob = InferenceJobQueue.shared.isBusy
+        if queuedBehindAnotherJob {
+            status.stringValue = "Queued for transcription. It will start when the current Whisper job finishes…"
+        }
+        InferenceJobQueue.shared.enqueue { finishJob in
             do {
                 let result = try Self.transcribe(file: file, model: model, language: lang,
                                                  detectSpeakers: detectSpeakers, control: operation, progress: reportProgress,
@@ -1221,6 +1461,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
                     self.finish()
                 }
             }
+            finishJob()
         }
     }
 
@@ -1251,7 +1492,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
         modelChanged()
         spinner.stopAnimation(nil)
         updateMeetingBadgeMenu()
-        if waitingForOperationBeforeQuit {
+        if waitingForOperationBeforeQuit && !InferenceJobQueue.shared.isBusy {
             waitingForOperationBeforeQuit = false
             NSApp.reply(toApplicationShouldTerminate: true)
         }
@@ -1308,7 +1549,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
     static func transcribe(file: URL, model: WhisperModel, language: String, detectSpeakers: Bool,
                                    control: OperationControl,
                                    progress: @escaping (String) -> Void,
-                                   liveTranscript: @escaping ([TranscriptSegment]) -> Void) throws ->
+                                   liveTranscript: @escaping ([TranscriptSegment]) -> Void,
+                                   outputBaseOverride: URL? = nil) throws ->
         (folder: URL, base: URL, segments: [TranscriptSegment], speakerIDs: [Int], speakerWarning: String?) {
         guard let cli = Bundle.main.resourceURL?.appendingPathComponent("whisper-cli"),
               FileManager.default.isExecutableFile(atPath: cli.path) else {
@@ -1334,7 +1576,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
         defer { try? FileManager.default.removeItem(at: wav) }
         progress("Converting audio from \(file.lastPathComponent)…")
         _ = try run(ffmpeg, ["-y", "-i", file.path, "-vn", "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", wav.path], control: control)
-        let base = file.deletingPathExtension()
+        let base = outputBaseOverride ?? file.deletingPathExtension()
         progress("Transcribing with \(model.id). Longer recordings may take several minutes…")
         let threads = max(4, ProcessInfo.processInfo.activeProcessorCount - 2)
         let vadURL = support.appendingPathComponent(WhisperModel.vadFile)
@@ -1708,5 +1950,380 @@ enum AppError: LocalizedError, Equatable {
         case .message(let text): return text
         case .cancelled: return "Operation cancelled."
         }
+    }
+}
+
+private final class MeetingSettingsDocumentView: NSView {
+    override var isFlipped: Bool { true }
+}
+
+extension AppDelegate {
+    private var detectionMode: MeetingDetectionMode {
+        MeetingDetectionMode(rawValue: UserDefaults.standard.string(forKey: "MeetingDetectionMode") ?? "") ?? .remind
+    }
+
+    private var enabledDetectionPlatforms: Set<MeetingPlatform> {
+        Set(MeetingPlatform.allCases.filter {
+            UserDefaults.standard.object(forKey: "MeetingDetection.\($0.rawValue)") as? Bool ?? ($0 != .other)
+        })
+    }
+
+    private var additionalDetectionApplications: [String: String] {
+        UserDefaults.standard.dictionary(forKey: "MeetingDetection.AdditionalApplications") as? [String: String] ?? [:]
+    }
+
+    private var additionalDetectionHosts: Set<String> {
+        Set(UserDefaults.standard.stringArray(forKey: "MeetingDetection.AdditionalHosts") ?? [])
+    }
+
+    private func configureMeetingDetection() {
+        meetingDetector.start(enabledPlatforms: { [weak self] in self?.enabledDetectionPlatforms ?? [] },
+                              isEnabled: { [weak self] in
+                                  guard let self else { return false }
+                                  return self.detectionMode != .manual && !self.isTerminating &&
+                                      !self.enabledDetectionPlatforms.isEmpty
+                              }, additionalApplications: { [weak self] in self?.additionalDetectionApplications ?? [:] },
+                              additionalWebsiteHosts: { [weak self] in self?.additionalDetectionHosts ?? [] },
+                              onAppOpened: { [weak self] opening in
+                                  guard let self else { return }
+                                  self.openingTracker.opened(opening, now: ProcessInfo.processInfo.systemUptime)
+                                  if self.meetingInProgress || self.detectionMode == .manual ||
+                                      (self.detectionMode == .automatic && opening.platform.supportsAutomaticCapture) { self.openingTracker.claim(opening.key) }
+                                  self.processOpeningReminders()
+                              }, onAppClosed: { [weak self] key in
+                                  guard let self else { return }
+                                  self.openingTracker.closed(key)
+                                  if self.promptedOpening?.key == key { self.closeDetectionPrompt() }
+                              }, onSnapshot: { [weak self] snapshot in self?.receiveDetectionSnapshot(snapshot) })
+    }
+
+    private func receiveDetectionSnapshot(_ snapshot: MeetingDetectionSnapshot) {
+        guard !isTerminating, detectionMode != .manual else { return }
+        detectionSnapshot = snapshot
+        let now = ProcessInfo.processInfo.systemUptime
+        // Configuration may have changed while a scan was in flight.
+        let signals = snapshot.evidence.filter { enabledDetectionPlatforms.contains($0.platform) }
+        detectionTracker.update(signals, now: now, coverage: snapshot.coverage)
+        openingTracker.updateWebsites(snapshot.openedWebsites.filter { enabledDetectionPlatforms.contains($0.platform) }, now: now, coverage: snapshot.coverage)
+        refreshDetectionSettings()
+        if let prompt = promptedMeeting, !detectionTracker.isPresent(prompt.key, now: now) { closeDetectionPrompt() }
+        if let prompt = promptedOpening, !openingTracker.isPresent(prompt.key) { closeDetectionPrompt() }
+        if meetingInProgress {
+            // Never start a second recording, including after manually stopping the current one.
+            detectionTracker.claimAll()
+            openingTracker.claimAll()
+            closeDetectionPrompt()
+            return
+        }
+        processOpeningReminders()
+        guard !isBusy, activeSummaryOperation == nil, detectionPanel == nil else { return }
+        guard let signal = detectionTracker.opportunities(now: now).first(where: {
+            detectionMode != .remind || !openingTracker.hasReminded($0.platform)
+        }) else { return }
+        if detectionMode == .automatic, signal.confirmedCall,
+           signal.platform.supportsAutomaticCapture,
+           detectionTracker.canAutoStart(signal.key, now: now), automaticSetupProblem == nil,
+           let folder = meetingRecordingsFolder {
+            detectionTracker.claim(signal.key)
+            beginMeeting(at: folder, detectedMeeting: signal)
+        } else {
+            // In Auto mode give the stronger signal time to settle before falling back
+            // to a reminder. Unconfirmed microphone use can never start a recording.
+            if detectionMode == .automatic && signal.confirmedCall &&
+                !detectionTracker.canAutoStart(signal.key, now: now) { return }
+            showDetectionPrompt(signal)
+        }
+    }
+
+    private func processOpeningReminders() {
+        guard detectionMode != .manual, !isTerminating, !meetingInProgress, !isBusy,
+              activeSummaryOperation == nil, detectionPanel == nil,
+              let opening = openingTracker.opportunities(now: ProcessInfo.processInfo.systemUptime).first(where: {
+                  enabledDetectionPlatforms.contains($0.platform) &&
+                      (detectionMode == .remind || !$0.platform.supportsAutomaticCapture)
+              }) else { return }
+        openingTracker.claim(opening.key)
+        promptedOpening = opening
+        lastOpeningReminder = opening
+        presentDetectionBanner(title: "\(opening.title) opened",
+                               message: "Planning a call? Start recording and live transcription when you’re ready. Audio and text stay on this Mac.")
+        refreshDetectionSettings()
+    }
+
+    private var automaticSetupProblem: String? {
+        if !MeetingDetector.supported { return "Meeting detection requires macOS 14.2 or later." }
+        if !MeetingDetector.accessibilityAvailable { return "Allow Accessibility access to confirm call controls." }
+        if meetingRecordingsFolder == nil { return "Choose a recordings folder before using Auto start." }
+        if !WhisperModel.isInstalled(at: MeetingCaptureController.turboModelURL) {
+            return "Download the meeting model before using Auto start, or start one meeting manually to download it."
+        }
+        if !meetingMicrophoneEnabled && !(meetingSystemAudioEnabled && supportsSystemAudioCapture) {
+            return "Enable at least one audio source."
+        }
+        return nil
+    }
+
+    private func refreshDetectionSettings() {
+        detectionModePicker.selectItem(at: MeetingDetectionMode.allCases.firstIndex(of: detectionMode) ?? 1)
+        for (platform, toggle) in detectionPlatformToggles {
+            toggle.state = enabledDetectionPlatforms.contains(platform) ? .on : .off
+        }
+        detectionAccessibilityButton.isEnabled = !MeetingDetector.accessibilityAvailable
+        detectionAccessibilityButton.title = MeetingDetector.accessibilityAvailable
+            ? "Accessibility access allowed" : "Allow meeting detection access…"
+        detectionFolderButton.title = meetingRecordingsFolder.map { "Recordings folder: \($0.lastPathComponent) — Change…" }
+            ?? "Choose recordings folder…"
+        detectionFolderButton.isEnabled = !meetingInProgress && !isTerminating
+        detectionModelButton.isEnabled = !WhisperModel.isInstalled(at: MeetingCaptureController.turboModelURL) &&
+            !isBusy && activeSummaryOperation == nil && !meetingInProgress && !isTerminating
+        detectionModelButton.title = WhisperModel.isInstalled(at: MeetingCaptureController.turboModelURL)
+            ? "Meeting model downloaded" : "Download meeting model (about 1.6 GB)"
+        let added = additionalDetectionApplications.values.sorted() + additionalDetectionHosts.sorted()
+        detectionAddedSourcesLabel.stringValue = added.isEmpty
+            ? "Add any installed calling app or the exact hostname of a private meeting website."
+            : "Added: " + added.joined(separator: ", ")
+        detectionClearSourcesButton.isEnabled = !added.isEmpty
+        if detectionMode == .manual {
+            detectionSettingsStatus.stringValue = "Detection is off. Use Start Meeting from the menu bar."
+        } else if enabledDetectionPlatforms.isEmpty {
+            detectionSettingsStatus.stringValue = "Select at least one meeting app to watch."
+        } else if detectionMode == .automatic, let problem = automaticSetupProblem {
+            detectionSettingsStatus.stringValue = "Auto start needs setup: \(problem) Reminders remain available."
+        } else {
+            let access = MeetingDetector.accessibilityAvailable ? "Website reminders are also available." : "Desktop app reminders work now. Allow Accessibility for website reminders."
+            detectionSettingsStatus.stringValue = "\(detectionMode == .automatic ? "Auto start is ready." : "Reminders are on.") \(access)"
+        }
+        if detectionMode == .remind, let last = lastOpeningReminder {
+            detectionSettingsStatus.stringValue += " Last reminder: \(last.title) opened."
+        }
+    }
+
+    @objc private func detectionModeChanged() {
+        let index = detectionModePicker.indexOfSelectedItem
+        guard MeetingDetectionMode.allCases.indices.contains(index) else { return }
+        setDetectionMode(MeetingDetectionMode.allCases[index])
+    }
+
+    @objc private func detectionModeFromMenu(_ sender: NSMenuItem) {
+        guard MeetingDetectionMode.allCases.indices.contains(sender.tag) else { return }
+        setDetectionMode(MeetingDetectionMode.allCases[sender.tag])
+        if detectionMode == .automatic { openMeetingSettings() }
+    }
+
+    private func setDetectionMode(_ mode: MeetingDetectionMode) {
+        guard mode != .automatic || MeetingDetector.supported else { return }
+        UserDefaults.standard.set(mode.rawValue, forKey: "MeetingDetectionMode")
+        closeDetectionPrompt()
+        detectionTracker = MeetingDetectionTracker()
+        // Invalidate in-flight scans whenever mode or platform configuration changes.
+        configureMeetingDetection()
+        refreshDetectionSettings()
+        updateMeetingBadgeMenu()
+    }
+
+    @objc private func detectionPlatformChanged(_ sender: NSButton) {
+        guard let raw = sender.identifier?.rawValue, MeetingPlatform(rawValue: raw) != nil else { return }
+        UserDefaults.standard.set(sender.state == .on, forKey: "MeetingDetection.\(raw)")
+        closeDetectionPrompt()
+        detectionTracker = MeetingDetectionTracker()
+        configureMeetingDetection()
+        refreshDetectionSettings()
+    }
+
+    @objc private func allowDetectionAccessibility() {
+        MeetingDetector.requestAccessibility()
+        refreshDetectionSettings()
+    }
+
+    @objc private func addDetectionApplication() {
+        let chooser = NSOpenPanel()
+        chooser.title = "Choose a calling app to watch"
+        chooser.message = "A reminder appears when this app opens. It does not confirm a call or automatically record."
+        chooser.allowedContentTypes = [.applicationBundle]
+        chooser.canChooseFiles = true
+        chooser.canChooseDirectories = false
+        chooser.allowsMultipleSelection = false
+        chooser.directoryURL = URL(fileURLWithPath: "/Applications", isDirectory: true)
+        guard chooser.runModal() == .OK, let url = chooser.url,
+              let bundle = Bundle(url: url), let id = bundle.bundleIdentifier else { return }
+        guard !MeetingPlatform.isBrowser(bundleID: id), id != Bundle.main.bundleIdentifier else {
+            detectionSettingsStatus.stringValue = "For a browser, use Add meeting website and enter the meeting site's hostname."
+            return
+        }
+        if let platform = MeetingPlatform.application(bundleID: id) {
+            UserDefaults.standard.set(true, forKey: "MeetingDetection.\(platform.rawValue)")
+        } else {
+            var applications = additionalDetectionApplications
+            applications[id] = (bundle.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String)
+                ?? (bundle.object(forInfoDictionaryKey: "CFBundleName") as? String)
+                ?? url.deletingPathExtension().lastPathComponent
+            UserDefaults.standard.set(applications, forKey: "MeetingDetection.AdditionalApplications")
+            UserDefaults.standard.set(true, forKey: "MeetingDetection.other")
+        }
+        closeDetectionPrompt()
+        configureMeetingDetection()
+        refreshDetectionSettings()
+    }
+
+    @objc private func addDetectionWebsite() {
+        let alert = NSAlert()
+        alert.messageText = "Add a meeting website"
+        alert.informativeText = "Enter its exact hostname or HTTPS URL, such as calls.example.org. Reminders apply to that host only and require Accessibility access."
+        let input = NSTextField(frame: NSRect(x: 0, y: 0, width: 360, height: 24))
+        input.placeholderString = "calls.example.org"
+        alert.accessoryView = input
+        alert.addButton(withTitle: "Add website")
+        alert.addButton(withTitle: "Cancel")
+        alert.window.initialFirstResponder = input
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        guard let host = MeetingAdditionalSources.websiteHost(input.stringValue) else {
+            detectionSettingsStatus.stringValue = "Enter a valid hostname or HTTPS URL without credentials or a port."
+            return
+        }
+        var hosts = additionalDetectionHosts
+        hosts.insert(host)
+        UserDefaults.standard.set(hosts.sorted(), forKey: "MeetingDetection.AdditionalHosts")
+        UserDefaults.standard.set(true, forKey: "MeetingDetection.other")
+        closeDetectionPrompt()
+        configureMeetingDetection()
+        refreshDetectionSettings()
+    }
+
+    @objc private func clearDetectionAdditionalSources() {
+        UserDefaults.standard.removeObject(forKey: "MeetingDetection.AdditionalApplications")
+        UserDefaults.standard.removeObject(forKey: "MeetingDetection.AdditionalHosts")
+        UserDefaults.standard.set(false, forKey: "MeetingDetection.other")
+        closeDetectionPrompt()
+        openingTracker.clearAdditionalSources()
+        configureMeetingDetection()
+        refreshDetectionSettings()
+    }
+
+    @objc private func previewDetectionReminder() {
+        if detectionPanel == nil {
+            presentDetectionBanner(title: "Zoom opened",
+                                   message: "Planning a call? Start recording and live transcription when you’re ready. Audio and text stay on this Mac.",
+                                   previewOnly: true)
+        }
+        // Focus only after the user explicitly asks to view the banner.
+        detectionPanel?.makeKeyAndOrderFront(nil)
+    }
+
+    @objc private func chooseMeetingRecordingsFolder() {
+        guard !meetingInProgress, !isTerminating else { return }
+        let panel = NSOpenPanel()
+        panel.title = "Choose where to save meeting recordings"
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = true
+        panel.prompt = "Use This Folder"
+        if panel.runModal() == .OK, let folder = panel.url {
+            UserDefaults.standard.set(folder.path, forKey: "MeetingOutputRoot")
+            refreshDetectionSettings()
+            updateMeetingCaptureControls()
+            updateMeetingBadgeMenu()
+        }
+    }
+
+    @objc private func downloadDetectionModel() {
+        guard let index = WhisperModel.choices.firstIndex(where: { $0.id == "large-v3-turbo" }) else { return }
+        modelPicker.selectItem(at: index)
+        modelChanged()
+        downloadSelectedModel()
+        refreshDetectionSettings()
+    }
+
+    private func showDetectionPrompt(_ signal: MeetingEvidence) {
+        detectionTracker.claim(signal.key)
+        promptedMeeting = signal
+        let titleText = "\(signal.confirmedCall ? "" : "Possible ")\(signal.platform.title) meeting detected"
+        let message: String
+        if detectionMode == .automatic, let problem = automaticSetupProblem {
+            message = "\(problem) You can start recording and transcribing manually now."
+        } else if !signal.confirmedCall {
+            message = "\(signal.platform.title) is using a microphone. Start recording and live transcription?"
+        } else {
+            message = "Start recording and live transcription on this Mac? You control when it stops."
+        }
+        presentDetectionBanner(title: titleText, message: message)
+    }
+
+    private func presentDetectionBanner(title titleText: String, message: String, previewOnly: Bool = false) {
+        let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 430, height: 158),
+                            styleMask: [.titled, .closable, .nonactivatingPanel], backing: .buffered, defer: false)
+        panel.title = previewOnly ? "Reminder preview" : "Meeting reminder"
+        panel.isReleasedWhenClosed = false
+        panel.level = .floating
+        panel.hidesOnDeactivate = false
+        panel.collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary]
+        let title = NSTextField(labelWithString: titleText)
+        title.font = .boldSystemFont(ofSize: 15)
+        let detail = settingsLabel(message)
+        let start = NSButton(title: "Start recording", target: self, action: #selector(startDetectedMeeting))
+        let dismiss = NSButton(title: "Dismiss", target: self, action: #selector(dismissDetectedMeeting))
+        let snooze = NSButton(title: "Snooze 10 min", target: self, action: #selector(snoozeDetectedMeeting))
+        start.isEnabled = !previewOnly
+        snooze.isEnabled = !previewOnly
+        let buttons = NSStackView(views: [start, dismiss, snooze])
+        buttons.orientation = .horizontal
+        buttons.spacing = 10
+        let stack = NSStackView(views: [title, detail, buttons])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 14
+        panel.contentView = NSView()
+        let content = panel.contentView!
+        content.addSubview(stack)
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 18),
+            stack.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -18),
+            stack.topAnchor.constraint(equalTo: content.topAnchor, constant: 18),
+            detail.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            stack.bottomAnchor.constraint(lessThanOrEqualTo: content.bottomAnchor, constant: -14)
+        ])
+        // Closing the panel is a dismissal too. No modal loop and no focus stealing.
+        NotificationCenter.default.addObserver(self, selector: #selector(detectionPanelClosed(_:)),
+                                               name: NSWindow.willCloseNotification, object: panel)
+        detectionPanel = panel
+        if let screen = NSScreen.main ?? NSScreen.screens.first {
+            let frame = screen.visibleFrame
+            panel.setFrameOrigin(NSPoint(x: max(frame.minX, frame.maxX - panel.frame.width - 18),
+                                         y: max(frame.minY, frame.maxY - panel.frame.height - 18)))
+        }
+        panel.orderFrontRegardless()
+    }
+
+    @objc private func startDetectedMeeting() {
+        let now = ProcessInfo.processInfo.systemUptime
+        let present = promptedOpening.map { openingTracker.isPresent($0.key) }
+            ?? promptedMeeting.map { detectionTracker.isPresent($0.key, now: now) } ?? false
+        guard present else { closeDetectionPrompt(); return }
+        startMeetingFromBadge()
+    }
+
+    @objc private func dismissDetectedMeeting() { closeDetectionPrompt() }
+
+    @objc private func snoozeDetectedMeeting() {
+        let now = ProcessInfo.processInfo.systemUptime
+        let key = promptedOpening?.key ?? promptedMeeting?.key ?? ""
+        detectionTracker.snooze(key, now: now)
+        openingTracker.snooze(key, now: now)
+        closeDetectionPrompt()
+    }
+
+    @objc private func detectionPanelClosed(_ notification: Notification) {
+        closeDetectionPrompt()
+    }
+
+    private func closeDetectionPrompt() {
+        if let panel = detectionPanel {
+            NotificationCenter.default.removeObserver(self, name: NSWindow.willCloseNotification, object: panel)
+            panel.orderOut(nil)
+        }
+        detectionPanel = nil
+        promptedMeeting = nil
+        promptedOpening = nil
     }
 }

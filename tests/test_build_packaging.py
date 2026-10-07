@@ -3,6 +3,7 @@
 import os
 import pathlib
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -29,6 +30,12 @@ elif tool == "sips":
     pathlib.Path(args[args.index("--out") + 1]).write_text("resized icon")
 elif tool == "iconutil":
     pathlib.Path(args[args.index("-o") + 1]).write_text("icns")
+elif tool == "python3":
+    if os.environ.get("FAIL_SIGNING") == "1":
+        print("Signing failure fixture", file=sys.stderr)
+        sys.exit(1)
+    if not args[0].endswith("scripts/sign-app.py"):
+        sys.exit(1)
 elif tool == "mv":
     if os.environ.get("FAIL_REPLACEMENT") == "1" and "/.TranscribeToText-build." in args[0] and args[0].endswith("/TranscribeToText.app"):
         sys.exit(1)
@@ -56,9 +63,9 @@ class BuildPackagingTests(unittest.TestCase):
             path.write_text("fixture")
         mock_bin = fixture / "mock-bin"
         mock_bin.mkdir()
-        for tool in ("swiftc", "lipo", "otool", "sips", "iconutil", "mv"):
+        for tool in ("swiftc", "lipo", "otool", "sips", "iconutil", "mv", "python3"):
             path = mock_bin / tool
-            path.write_text(MOCK_TOOL)
+            path.write_text(MOCK_TOOL.replace("#!/usr/bin/env python3", "#!" + sys.executable))
             path.chmod(0o755)
         environment = os.environ.copy()
         environment.update({"FIXTURE_ROOT": str(fixture),
@@ -86,6 +93,11 @@ SHERPA="$ROOT/vendor/sherpa-onnx"
         result, fixture, app = self.run_packaging(UNBUNDLED="1")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("libraries outside the app", result.stderr)
+        self.assert_old_bundle_preserved(fixture, app)
+
+    def test_signing_failure_preserves_previous_bundle(self):
+        result, fixture, app = self.run_packaging(FAIL_SIGNING="1")
+        self.assertNotEqual(result.returncode, 0)
         self.assert_old_bundle_preserved(fixture, app)
 
     def test_failed_replacement_restores_previous_bundle(self):

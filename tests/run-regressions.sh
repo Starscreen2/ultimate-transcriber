@@ -8,15 +8,19 @@ export PYTHONDONTWRITEBYTECODE=1
 TEMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/transcriber-tests.XXXXXX")"
 trap 'rm -rf "$TEMP_ROOT"' EXIT
 SWIFT_FLAGS=(-DREGRESSION_TESTS -parse-as-library -swift-version 5 -target arm64-apple-macos13.0
-  -framework AppKit -framework AVFoundation -framework CoreAudio -framework UniformTypeIdentifiers)
-SWIFT_SOURCES=(TranscribeToText.swift MeetingCapture.swift LocalMeetingSummarizer.swift)
+  -framework AppKit -framework AVFoundation -framework CoreAudio -framework ApplicationServices -framework UniformTypeIdentifiers)
+SWIFT_SOURCES=(TranscribeToText.swift MeetingCapture.swift LocalMeetingSummarizer.swift MeetingDetection.swift)
 swiftc "${SWIFT_FLAGS[@]}" "${SWIFT_SOURCES[@]}" tests/CoreRegressionTests.swift -o "$TEMP_ROOT/core-regressions"
+swiftc "${SWIFT_FLAGS[@]}" "${SWIFT_SOURCES[@]}" tests/MeetingDetectionTests.swift -o "$TEMP_ROOT/detection-regressions"
+"$TEMP_ROOT/detection-regressions"
 "$TEMP_ROOT/core-regressions"
 swiftc "${SWIFT_FLAGS[@]}" "${SWIFT_SOURCES[@]}" tests/summary-regressions.swift -o "$TEMP_ROOT/summary-regressions"
 "$TEMP_ROOT/summary-regressions" "$@"
 "$TEST_PYTHON" tests/meeting_worker_regressions.py
+"$TEST_PYTHON" tests/meeting_capture_regressions.py
 "$TEST_PYTHON" tests/test_meeting_whisper.py
 "$TEST_PYTHON" tests/test_build_packaging.py
+"$TEST_PYTHON" tests/signing_identity_regressions.py
 if [[ " $* " == *" --real-model "* ]]; then
   SMOKE_APP="$TEMP_ROOT/FileSmoke.app"
   mkdir -p "$SMOKE_APP/Contents/MacOS"
@@ -28,4 +32,6 @@ if [[ " $* " == *" --real-model "* ]]; then
 PLIST
   swiftc "${SWIFT_FLAGS[@]}" "${SWIFT_SOURCES[@]}" tests/FileTranscriptionSmoke.swift -o "$SMOKE_APP/Contents/MacOS/FileSmoke"
   "$SMOKE_APP/Contents/MacOS/FileSmoke"
+  swiftc "${SWIFT_FLAGS[@]}" "${SWIFT_SOURCES[@]}" tests/MeetingCaptureStartupSmoke.swift -o "$SMOKE_APP/Contents/MacOS/StartupSmoke"
+  "$SMOKE_APP/Contents/MacOS/StartupSmoke"
 fi

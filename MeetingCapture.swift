@@ -3,7 +3,67 @@ import AppKit
 import CoreAudio
 import Darwin
 
+final class InferenceJobQueue {
+    static let shared = InferenceJobQueue()
+    typealias Job = (@escaping () -> Void) -> Void
+    private let lock = NSLock()
+    private var jobs: [Job] = []
+    private var running = false
+    var onIdle: (() -> Void)?
+
+    private init() {}
+
+    var isBusy: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return running || !jobs.isEmpty
+    }
+
+    func tryAcquire() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard !running, jobs.isEmpty else { return false }
+        running = true
+        return true
+    }
+
+    func enqueue(_ job: @escaping Job) {
+        lock.lock()
+        jobs.append(job)
+        let shouldStart = !running
+        if shouldStart { running = true }
+        lock.unlock()
+        if shouldStart { startNext() }
+    }
+
+    func release() {
+        lock.lock()
+        if jobs.isEmpty {
+            running = false
+            let idle = onIdle
+            lock.unlock()
+            DispatchQueue.main.async { idle?() }
+            return
+        }
+        lock.unlock()
+        startNext()
+    }
+
+    private func startNext() {
+        lock.lock()
+        guard !jobs.isEmpty else {
+            running = false
+            lock.unlock()
+            return
+        }
+        let job = jobs.removeFirst()
+        lock.unlock()
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            job { self?.release() }
+        }
+    }
+}
+
 struct MeetingSessionResult {
+    let sessionID: UUID
     let folder: URL
     let audioFile: URL
     let transcriptBase: URL
@@ -144,6 +204,7 @@ private final class CoreAudioSystemCapture {
 }
 
 private final class MeetingAudioSourceState {
+    let sessionID: UUID
     let source: MeetingAudioSource
     let recordingURL: URL
     var file: AVAudioFile?
@@ -153,9 +214,10 @@ private final class MeetingAudioSourceState {
     var sessionOffset: Double?
     // Accessed only on the controller's serial capture queue.
     var acceptsAudio = true
-    let worker: LiveWhisperWorker
+    let worker: LiveWhisperWorker?
 
-    init(source: MeetingAudioSource, recordingURL: URL, worker: LiveWhisperWorker) {
+    init(sessionID: UUID, source: MeetingAudioSource, recordingURL: URL, worker: LiveWhisperWorker?) {
+        self.sessionID = sessionID
         self.source = source
         self.recordingURL = recordingURL
         self.worker = worker
@@ -180,9 +242,16 @@ private final class LiveWhisperWorker: @unchecked Sendable {
     private var didRequestFinish = false
     private var didFinishNormally = false
     private var failureMessage: String?
+    private var pendingInputBytes = 0
+    private var inputFailed = false
+    // Bound queued PCM when inference stalls. Audio still goes to the source file;
+    // after overflow, never resume this worker with gaps that shift timestamps.
+    static let maxPendingInputBytes = 8 * 1024 * 1024
+    private let onWarning: ((String) -> Void)?
     private let onSegment: (TranscriptSegment) -> Void
 
-    init(onSegment: @escaping (TranscriptSegment) -> Void) {
+    init(onWarning: ((String) -> Void)? = nil, onSegment: @escaping (TranscriptSegment) -> Void) {
+        self.onWarning = onWarning
         self.onSegment = onSegment
         outputClosed.enter()
         processExited.enter()
@@ -237,13 +306,25 @@ private final class LiveWhisperWorker: @unchecked Sendable {
 
     func append(_ samples: [Float]) {
         guard !samples.isEmpty else { return }
+        let byteCount = samples.count * MemoryLayout<Float>.stride
         stateLock.lock()
-        let canAppend = !didRequestFinish && !didExitProcess
+        guard !didRequestFinish, !didExitProcess, !inputFailed else { stateLock.unlock(); return }
+        guard byteCount <= Self.maxPendingInputBytes - pendingInputBytes else {
+            inputFailed = true
+            stateLock.unlock()
+            recordFailure("Live transcription fell behind. Further audio is being saved without live text; transcribe the saved recording afterward.")
+            return
+        }
+        pendingInputBytes += byteCount
         stateLock.unlock()
-        guard canAppend else { return }
         let data = samples.withUnsafeBufferPointer { Data(buffer: $0) }
         inputQueue.async { [weak self] in
             guard let self else { return }
+            defer {
+                self.stateLock.lock()
+                self.pendingInputBytes -= byteCount
+                self.stateLock.unlock()
+            }
             guard self.process.isRunning else {
                 self.recordFailure("The live transcription engine stopped before the meeting ended.")
                 return
@@ -371,8 +452,11 @@ private final class LiveWhisperWorker: @unchecked Sendable {
 
     private func recordFailure(_ message: String) {
         stateLock.lock()
-        if failureMessage == nil { failureMessage = message }
+        let shouldWarn = failureMessage == nil
+        if shouldWarn { failureMessage = message }
+        inputFailed = true
         stateLock.unlock()
+        if shouldWarn { onWarning?(message) }
     }
 
     private func signalOutputClosed() {
@@ -387,11 +471,12 @@ private final class LiveWhisperWorker: @unchecked Sendable {
 }
 
 final class MeetingCaptureController: NSObject {
-    var onStatus: ((String) -> Void)?
-    var onStateChange: ((Bool) -> Void)?
-    var onLiveSegments: (([TranscriptSegment]) -> Void)?
+    var onStatus: ((UUID, String) -> Void)?
+    var onStateChange: ((UUID, Bool) -> Void)?
+    var onLiveSegments: ((UUID, [TranscriptSegment]) -> Void)?
+    var onCaptureStopped: ((UUID) -> Void)?
     var onFinished: ((MeetingSessionResult) -> Void)?
-    var onFailure: ((String, URL?) -> Void)?
+    var onFailure: ((UUID, String, URL?) -> Void)?
 
     private let captureQueue = DispatchQueue(label: "local.transcribetotext.meeting-audio")
     private let stateLock = NSLock()
@@ -399,6 +484,7 @@ final class MeetingCaptureController: NSObject {
     private var audioEngine: AVAudioEngine?
     private var systemCapture: AnyObject?
     private var sessionFolder: URL?
+    private var sessionID = UUID()
     private var sessionStartedAt = 0.0
     private var sessionSegments: [TranscriptSegment] = []
     private var isActive = false
@@ -408,6 +494,7 @@ final class MeetingCaptureController: NSObject {
     private var preparationControl: OperationControl?
     private var preparingWorkers: [LiveWhisperWorker] = []
     private var stopRequested = false
+    private var liveTranscriptionEnabled = false
 
     var active: Bool {
         stateLock.lock(); defer { stateLock.unlock() }
@@ -438,7 +525,7 @@ final class MeetingCaptureController: NSObject {
     private func installSourceState(_ state: MeetingAudioSourceState) {
         stateLock.lock()
         sourceStates[state.source] = state
-        preparingWorkers.removeAll { $0 === state.worker }
+        if let worker = state.worker { preparingWorkers.removeAll { $0 === worker } }
         stateLock.unlock()
     }
 
@@ -499,12 +586,15 @@ final class MeetingCaptureController: NSObject {
             .appendingPathComponent("ggml-large-v3-turbo.bin")
     }
 
-    func start(meetingsRoot: URL, includeMicrophone: Bool, includeSystemAudio: Bool) {
+    func start(sessionID: UUID, liveTranscription: Bool, meetingsRoot: URL, includeMicrophone: Bool, includeSystemAudio: Bool,
+               shouldBeginCapture: (() async -> Bool)? = nil) {
         stateLock.lock()
         guard !isActive, !isStarting, !isStopping else { stateLock.unlock(); return }
         isStarting = true
         stopRequested = false
         sessionFolder = nil
+        self.sessionID = sessionID
+        liveTranscriptionEnabled = liveTranscription
         let control = OperationControl()
         preparationControl = control
         stateLock.unlock()
@@ -512,7 +602,8 @@ final class MeetingCaptureController: NSObject {
             do {
                 try await beginSession(meetingsRoot: meetingsRoot,
                                        includeMicrophone: includeMicrophone,
-                                       includeSystemAudio: includeSystemAudio, control: control)
+                                       includeSystemAudio: includeSystemAudio, control: control,
+                                       shouldBeginCapture: shouldBeginCapture)
             } catch {
                 await cleanupAfterFailedStart()
                 let preservedFolder = sessionFolder.flatMap { folder -> URL? in
@@ -520,8 +611,10 @@ final class MeetingCaptureController: NSObject {
                     return folder
                 }
                 updateState(active: false, starting: false, stopping: false)
-                onStateChange?(false)
-                onFailure?(error.localizedDescription, preservedFolder)
+                if liveTranscription { InferenceJobQueue.shared.release() }
+                onStateChange?(sessionID, false)
+                let details = [error.localizedDescription, captureWarning()].compactMap { $0 }.joined(separator: " ")
+                onFailure?(sessionID, details, preservedFolder)
             }
         }
     }
@@ -541,7 +634,9 @@ final class MeetingCaptureController: NSObject {
         Task { await finishSession() }
     }
 
-    private func beginSession(meetingsRoot: URL, includeMicrophone: Bool, includeSystemAudio: Bool, control: OperationControl) async throws {
+    private func beginSession(meetingsRoot: URL, includeMicrophone: Bool, includeSystemAudio: Bool, control: OperationControl,
+                              shouldBeginCapture: (() async -> Bool)?) async throws {
+        let startedSessionID = sessionID
         try control.check()
         guard includeMicrophone || includeSystemAudio else {
             throw AppError.message("Turn on at least one meeting audio source in Settings.")
@@ -560,7 +655,7 @@ final class MeetingCaptureController: NSObject {
         }
         resetSessionTimeline()
 
-        onStatus?("Checking selected audio-source access…")
+        onStatus?(startedSessionID, "Checking selected audio-source access…")
         let microphonePermission = includeMicrophone ? await Self.requestMicrophonePermission() : false
         try control.check()
         var microphoneError: String? = includeMicrophone && !microphonePermission
@@ -587,14 +682,16 @@ final class MeetingCaptureController: NSObject {
             throw AppError.message("No selected meeting audio source is available. \(reasons)")
         }
 
-        onStatus?("Preparing the local live transcription model…")
+        onStatus?(startedSessionID, liveTranscriptionEnabled
+            ? "Preparing the local live transcription model…"
+            : "Recording now. Whisper is busy; this meeting will be transcribed when it is its turn…")
         let modelURL = Self.turboModelURL
-        if !WhisperModel.isInstalled(at: modelURL) {
+        if liveTranscriptionEnabled && !WhisperModel.isInstalled(at: modelURL) {
             guard let model = WhisperModel.choices.first(where: { $0.id == "large-v3-turbo" }) else {
                 throw AppError.message("The Large v3 Turbo meeting model is not configured.")
             }
             try await Self.downloadMeetingModel(from: model.url, to: modelURL, control: control) { [weak self] message in
-                self?.onStatus?(message)
+                self?.onStatus?(startedSessionID, message)
             }
         }
 
@@ -603,41 +700,43 @@ final class MeetingCaptureController: NSObject {
         sessionFolder = folder
 
         var microphoneWorker: LiveWhisperWorker?
-        if canUseMicrophone {
+        if canUseMicrophone && liveTranscriptionEnabled {
             do { microphoneWorker = try makeWorker(source: .microphone, model: modelURL, control: control) }
             catch { microphoneError = error.localizedDescription }
         }
 
         try control.check()
         var systemWorker: LiveWhisperWorker?
-        if canUseSystemAudio {
+        if canUseSystemAudio && liveTranscriptionEnabled {
             do { systemWorker = try makeWorker(source: .system, model: modelURL, control: control) }
             catch { systemAudioError = error.localizedDescription }
         }
 
         try control.check()
+        if let shouldBeginCapture, !(await shouldBeginCapture()) {
+            throw AppError.message("Automatic recording canceled because the detected call is no longer confirmed. Start manually if you are still in the meeting.")
+        }
+        try control.check()
         // Start system audio first so a system-audio permission prompt never leaves the
         // microphone recording while setup is blocked.
-        if canUseSystemAudio, let worker = systemWorker {
+        if canUseSystemAudio {
             if #available(macOS 14.2, *) {
-                do { try startSystemAudio(worker: worker, folder: folder) }
+                do { try startSystemAudio(worker: systemWorker, folder: folder) }
                 catch {
                     systemAudioError = "System-audio capture could not start. Allow system-audio access in System Settings and try again. \(error.localizedDescription)"
-                    if let state = removeSourceState(.system) { _ = await state.worker.finish() }
-                    else { _ = await worker.finish() }
-                    removePreparingWorker(worker)
+                    if let state = removeSourceState(.system), let worker = state.worker { _ = await worker.finish() }
+                    if let systemWorker { _ = await systemWorker.finish(); removePreparingWorker(systemWorker) }
                 }
             }
         }
 
         try control.check()
-        if let worker = microphoneWorker {
-            do { try startMicrophone(worker: worker, folder: folder) }
+        if canUseMicrophone {
+            do { try startMicrophone(worker: microphoneWorker, folder: folder) }
             catch {
                 microphoneError = error.localizedDescription
-                if let state = removeSourceState(.microphone) { _ = await state.worker.finish() }
-                else { _ = await worker.finish() }
-                removePreparingWorker(worker)
+                if let state = removeSourceState(.microphone), let worker = state.worker { _ = await worker.finish() }
+                if let microphoneWorker { _ = await microphoneWorker.finish(); removePreparingWorker(microphoneWorker) }
             }
         }
 
@@ -649,36 +748,45 @@ final class MeetingCaptureController: NSObject {
 
         // Stop requested during preparation must win over entering capture.
         try completeStartup()
-        onStateChange?(true)
+        onStateChange?(sessionID, true)
         let available = startedSources.keys.map { $0 == .microphone ? "microphone" : "system audio" }.sorted().joined(separator: " and ")
         let missing = [microphoneError, systemAudioError].compactMap { $0 }
-        if missing.isEmpty {
-            onStatus?("")
+        if !liveTranscriptionEnabled {
+            onStatus?(startedSessionID, "Recording. Transcript will start when Whisper is available…")
+        } else if missing.isEmpty {
+            onStatus?(startedSessionID, "")
         } else {
-            onStatus?("Only \(available) is available. Another audio source is unavailable: \(missing.joined(separator: " "))")
+            onStatus?(startedSessionID, "Only \(available) is available. Another audio source is unavailable: \(missing.joined(separator: " "))")
         }
     }
 
-    private static func requestMicrophonePermission() async -> Bool {
-        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+    private static func requestMicrophonePermission(
+        status: AVAuthorizationStatus = AVCaptureDevice.authorizationStatus(for: .audio),
+        requestAccess: @escaping (@escaping @Sendable (Bool) -> Void) -> Void = {
+            AVCaptureDevice.requestAccess(for: .audio, completionHandler: $0)
+        }
+    ) async -> Bool {
+        // Always consult macOS, so revocation takes effect. Only an undecided
+        // authorization can show a prompt; later meetings reuse the OS grant.
+        switch status {
         case .authorized: return true
         case .denied, .restricted: return false
         case .notDetermined:
             return await withCheckedContinuation { continuation in
-                AVCaptureDevice.requestAccess(for: .audio) { continuation.resume(returning: $0) }
+                requestAccess { continuation.resume(returning: $0) }
             }
         @unknown default: return false
         }
     }
 
-    private func startMicrophone(worker: LiveWhisperWorker, folder: URL) throws {
+    private func startMicrophone(worker: LiveWhisperWorker?, folder: URL) throws {
         let engine = AVAudioEngine()
         let input = engine.inputNode
         let format = input.outputFormat(forBus: 0)
         guard format.sampleRate > 0, format.channelCount > 0 else {
             throw AppError.message("macOS did not provide an audio input format for the microphone.")
         }
-        let state = MeetingAudioSourceState(source: .microphone,
+        let state = MeetingAudioSourceState(sessionID: sessionID, source: .microphone,
                                             recordingURL: folder.appendingPathComponent("microphone.caf"),
                                             worker: worker)
         installSourceState(state)
@@ -700,8 +808,8 @@ final class MeetingCaptureController: NSObject {
     }
 
     @available(macOS 14.2, *)
-    private func startSystemAudio(worker: LiveWhisperWorker, folder: URL) throws {
-        let state = MeetingAudioSourceState(source: .system,
+    private func startSystemAudio(worker: LiveWhisperWorker?, folder: URL) throws {
+        let state = MeetingAudioSourceState(sessionID: sessionID, source: .system,
                                             recordingURL: folder.appendingPathComponent("meeting-audio.caf"),
                                             worker: worker)
         installSourceState(state)
@@ -719,8 +827,9 @@ final class MeetingCaptureController: NSObject {
               FileManager.default.isExecutableFile(atPath: executable.path) else {
             throw AppError.message("The live Whisper engine is missing. Rebuild the app with ./build-app.sh.")
         }
-        let worker = LiveWhisperWorker { [weak self] segment in
-            self?.receive(segment, source: source)
+        let workerSessionID = sessionID
+        let worker = LiveWhisperWorker(onWarning: { [weak self] message in self?.onStatus?(workerSessionID, message) }) { [weak self] segment in
+            self?.receive(segment, source: source, sessionID: workerSessionID)
         }
         try worker.start(executable: executable, model: model, control: control)
         stateLock.lock()
@@ -760,15 +869,20 @@ final class MeetingCaptureController: NSObject {
                                              commonFormat: buffer.format.commonFormat,
                                              interleaved: buffer.format.isInterleaved)
                 state.inputFormat = buffer.format
-                guard let target = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16_000,
-                                                 channels: 1, interleaved: false),
-                      let converter = AVAudioConverter(from: buffer.format, to: target) else {
-                    throw AppError.message("The meeting audio format could not be converted for live transcription.")
+                if state.worker != nil {
+                    guard let target = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16_000,
+                                                     channels: 1, interleaved: false),
+                          let converter = AVAudioConverter(from: buffer.format, to: target) else {
+                        throw AppError.message("The meeting audio format could not be converted for live transcription.")
+                    }
+                    state.converter = converter
                 }
-                state.converter = converter
+            }
+            if let format = state.inputFormat, !format.isEqual(buffer.format) {
+                throw AppError.message("The audio device changed format during recording. Start a new recording to use the new device.")
             }
             try state.file?.write(from: buffer)
-            guard let converter = state.converter else { return }
+            guard let worker = state.worker, let converter = state.converter else { return }
             let target = converter.outputFormat
             let capacity = AVAudioFrameCount(ceil(Double(buffer.frameLength) * target.sampleRate / buffer.format.sampleRate) + 32)
             guard let converted = AVAudioPCMBuffer(pcmFormat: target, frameCapacity: capacity) else { return }
@@ -784,8 +898,8 @@ final class MeetingCaptureController: NSObject {
                 return buffer
             }
             guard conversionStatus != .error, let samples = converted.floatChannelData?.pointee else {
-                if let conversionError { throw conversionError }
-                return
+                throw conversionError ?? NSError(domain: "MeetingCapture", code: 1,
+                    userInfo: [NSLocalizedDescriptionKey: "The audio converter stopped producing live transcription samples."])
             }
             let count = Int(converted.frameLength)
             if count > 0 { state.pendingSamples.append(contentsOf: UnsafeBufferPointer(start: samples, count: count)) }
@@ -793,24 +907,33 @@ final class MeetingCaptureController: NSObject {
             while state.pendingSamples.count >= packetSize {
                 let packet = Array(state.pendingSamples.prefix(packetSize))
                 state.pendingSamples.removeFirst(packetSize)
-                state.worker.append(packet)
+                worker.append(packet)
             }
         } catch {
+            // Retrying a failed file/converter on every buffer silently loses audio
+            // and floods the capture queue. Retire this source and tell the user.
+            state.acceptsAudio = false
+            state.file = nil
+            let source = state.source == .microphone ? "Microphone" : "System audio"
+            let message = "\(source) recording stopped: \(error.localizedDescription)"
             stateLock.lock()
-            observedCaptureError = error.localizedDescription
+            observedCaptureError = [observedCaptureError, message].compactMap { $0 }.joined(separator: " ")
             stateLock.unlock()
+            onStatus?(state.sessionID, message)
+            if allSourceStates().values.allSatisfy({ !$0.acceptsAudio }) { stop() }
         }
     }
 
-    private func receive(_ segment: TranscriptSegment, source: MeetingAudioSource) {
+    private func receive(_ segment: TranscriptSegment, source: MeetingAudioSource, sessionID: UUID) {
         stateLock.lock()
-        guard let offset = sourceStates[source]?.sessionOffset else { stateLock.unlock(); return }
+        guard let state = sourceStates[source], state.sessionID == sessionID,
+              let offset = state.sessionOffset else { stateLock.unlock(); return }
         let adjusted = TranscriptSegment(start: segment.start + offset, end: segment.end + offset,
                                          text: segment.text, speakerID: nil)
         sessionSegments = Self.uniqueMeetingSegments(sessionSegments + [adjusted])
         let snapshot = sessionSegments
         stateLock.unlock()
-        onLiveSegments?(snapshot)
+        onLiveSegments?(sessionID, snapshot)
     }
 
     static func uniqueMeetingSegments(_ segments: [TranscriptSegment]) -> [TranscriptSegment] {
@@ -824,7 +947,8 @@ final class MeetingCaptureController: NSObject {
     }
 
     private func finishSession() async {
-        onStatus?("Finishing live transcription and saving the meeting…")
+        let stoppingSessionID = sessionID
+        onStatus?(stoppingSessionID, "Finishing live transcription and saving the meeting…")
         audioEngine?.inputNode.removeTap(onBus: 0)
         audioEngine?.stop()
         audioEngine = nil
@@ -837,17 +961,89 @@ final class MeetingCaptureController: NSObject {
         captureQueue.sync {
             for state in states.values {
                 state.acceptsAudio = false
-                if !state.pendingSamples.isEmpty {
-                    state.worker.append(state.pendingSamples)
+                if let worker = state.worker, !state.pendingSamples.isEmpty {
+                    worker.append(state.pendingSamples)
                     state.pendingSamples.removeAll(keepingCapacity: false)
                 }
                 state.file = nil
             }
         }
 
+        // Save the transcript accumulated during recording immediately after
+        // capture has stopped. The workers may still decode their final audio
+        // chunks; the completed transcript below will replace this snapshot.
+        let folder = sessionFolder
+        let finishedSessionID = sessionID
+        let snapshot: [TranscriptSegment] = stateLock.withLock { sessionSegments }
+        if let folder {
+            do {
+                try AppDelegate.writeExports(base: folder.appendingPathComponent("transcript"),
+                                             segments: snapshot, names: [:])
+            } catch {
+                stateLock.lock()
+                observedCaptureError = [observedCaptureError,
+                    "The transcript could not be saved immediately: \(error.localizedDescription)"]
+                    .compactMap { $0 }.joined(separator: " ")
+                stateLock.unlock()
+            }
+        }
+
+        let sessionWarning: String? = stateLock.withLock {
+            let warning = observedCaptureError
+            sourceStates.removeAll()
+            sessionFolder = nil
+            sessionSegments = []
+            sessionStartedAt = 0
+            observedCaptureError = nil
+            isActive = false
+            isStopping = false
+            return warning
+        }
+        // Release audio capture as soon as its files are closed. A new meeting
+        // can now start while this session finishes decoding its final chunks.
+        onStateChange?(finishedSessionID, false)
+        onCaptureStopped?(finishedSessionID)
+
+        guard states.values.contains(where: { $0.worker != nil }) else {
+            // This session has no live worker. Close and mix its audio, then
+            // enqueue a normal local transcription (or transfer its queue lease).
+            do {
+                guard let folder else { throw AppError.message("The meeting folder is missing.") }
+                let recordings = states.values.map { (url: $0.recordingURL, offset: self.offset(for: $0)) }
+                let audio = try Self.mixRecordings(in: folder, recordings: recordings)
+                let transcriptModel = WhisperModel.choices.first(where: { $0.id == "large-v3-turbo" })
+                    ?? WhisperModel.choices[0]
+                InferenceJobQueue.shared.enqueue { [weak self] finishJob in
+                    guard let self else { finishJob(); return }
+                    do {
+                        let result = try AppDelegate.transcribe(
+                            file: audio, model: transcriptModel, language: "auto", detectSpeakers: true,
+                            control: OperationControl(), progress: { [weak self] message in
+                                self?.onStatus?(finishedSessionID, message)
+                            }, liveTranscript: { _ in }, outputBaseOverride: folder.appendingPathComponent("transcript"))
+                        let warnings = [sessionWarning, result.speakerWarning].compactMap { $0 }.joined(separator: " ")
+                        self.onFinished?(MeetingSessionResult(sessionID: finishedSessionID, folder: folder,
+                            audioFile: audio, transcriptBase: result.base, segments: result.segments,
+                            speakerIDs: result.speakerIDs, speakerWarning: warnings.isEmpty ? nil : warnings))
+                    } catch {
+                        self.onFailure?(finishedSessionID,
+                            "Meeting transcript failed. The recording remains saved: \(error.localizedDescription)", folder)
+                    }
+                    finishJob()
+                }
+                if liveTranscriptionEnabled { InferenceJobQueue.shared.release() }
+            } catch {
+                if liveTranscriptionEnabled { InferenceJobQueue.shared.release() }
+                onFailure?(finishedSessionID,
+                    "Meeting audio could not be prepared for transcription: \(error.localizedDescription)", folder)
+            }
+            return
+        }
+
         var finalSegments: [TranscriptSegment] = []
         for state in states.values {
-            let segments = await state.worker.finish()
+            guard let worker = state.worker else { continue }
+            let segments = await worker.finish()
             let offset = self.offset(for: state)
             finalSegments += segments.map {
                 TranscriptSegment(start: $0.start + offset, end: $0.end + offset, text: $0.text, speakerID: nil)
@@ -856,9 +1052,10 @@ final class MeetingCaptureController: NSObject {
         finalSegments = Self.uniqueMeetingSegments(finalSegments)
 
         do {
-            guard let folder = sessionFolder else { throw AppError.message("The meeting folder is missing.") }
+            guard let folder else { throw AppError.message("The meeting folder is missing.") }
             let recordings = states.values.map { (url: $0.recordingURL, offset: self.offset(for: $0)) }
-            let audio = try Self.mixRecordings(in: folder, recordings: recordings)
+            let saved = try Self.saveTranscriptAndMixRecordings(in: folder, segments: finalSegments, recordings: recordings)
+            let audio = saved.audio
             let diarization = try await Self.detectSpeakers(in: audio)
             var labeled = finalSegments
             for index in labeled.indices {
@@ -870,24 +1067,19 @@ final class MeetingCaptureController: NSObject {
                 labeled[index].speakerID = overlaps.max(by: { $0.value < $1.value })?.key
             }
             let speakerIDs = Array(Set(labeled.compactMap(\.speakerID))).sorted()
-            let base = folder.appendingPathComponent("transcript")
+            let base = saved.transcriptBase
             let names = Dictionary(uniqueKeysWithValues: speakerIDs.enumerated().map { ($1, "Speaker \($0 + 1)") })
             try AppDelegate.writeExports(base: base, segments: labeled, names: names)
-            let warnings = [diarization.warning, captureWarning()] + states.values.compactMap { $0.worker.failureWarning }
-            clearSourceStates()
-            updateState(active: false, starting: false, stopping: false)
-            onStateChange?(false)
+            let warnings = [diarization.warning, sessionWarning] + states.values.compactMap { $0.worker?.failureWarning }
             let warning = warnings.compactMap { $0 }.joined(separator: " ")
-            onFinished?(MeetingSessionResult(folder: folder, audioFile: audio, transcriptBase: base,
+            onFinished?(MeetingSessionResult(sessionID: finishedSessionID, folder: folder, audioFile: audio, transcriptBase: base,
                                             segments: labeled, speakerIDs: speakerIDs,
                                             speakerWarning: warning.isEmpty ? nil : warning))
         } catch {
-            let preservedFolder = sessionFolder
-            clearSourceStates()
-            updateState(active: false, starting: false, stopping: false)
-            onStateChange?(false)
-            onFailure?("The meeting audio was captured, but final processing failed: \(error.localizedDescription)", preservedFolder)
+            let details = [sessionWarning, error.localizedDescription].compactMap { $0 }.joined(separator: " ")
+            onFailure?(finishedSessionID, "Meeting final processing failed. Saved files remain in the meeting folder: \(details)", folder)
         }
+        InferenceJobQueue.shared.release()
     }
 
     private func cleanupAfterFailedStart() async {
@@ -902,18 +1094,47 @@ final class MeetingCaptureController: NSObject {
         captureQueue.sync {
             for state in states.values {
                 state.acceptsAudio = false
+                if let worker = state.worker, !state.pendingSamples.isEmpty {
+                    worker.append(state.pendingSamples)
+                    state.pendingSamples.removeAll(keepingCapacity: false)
+                }
                 state.file = nil
             }
         }
         let unattachedWorkers = takePreparingWorkers()
-        for state in states.values { _ = await state.worker.finish() }
+        var recovered: [TranscriptSegment] = []
+        for state in states.values {
+            guard let worker = state.worker else { continue }
+            let offset = self.offset(for: state)
+            recovered += await worker.finish().map {
+                TranscriptSegment(start: $0.start + offset, end: $0.end + offset, text: $0.text, speakerID: nil)
+            }
+        }
         for worker in unattachedWorkers { _ = await worker.finish() }
+        if let sessionFolder, !recovered.isEmpty {
+            do {
+                try AppDelegate.writeExports(base: sessionFolder.appendingPathComponent("transcript"),
+                                             segments: Self.uniqueMeetingSegments(recovered), names: [:])
+            } catch {
+                stateLock.withLock { observedCaptureError = [observedCaptureError, error.localizedDescription].compactMap { $0 }.joined(separator: " ") }
+            }
+        }
         clearSourceStates()
         if let sessionFolder,
            let items = try? FileManager.default.contentsOfDirectory(atPath: sessionFolder.path), items.isEmpty {
             try? FileManager.default.removeItem(at: sessionFolder)
             self.sessionFolder = nil
         }
+    }
+
+    // Persist the completed transcript before optional audio/speaker processing.
+    // A missing converter, corrupt source, or short recording must not lose text.
+    static func saveTranscriptAndMixRecordings(in folder: URL, segments: [TranscriptSegment],
+                                               recordings: [(url: URL, offset: Double)]) throws -> (audio: URL, transcriptBase: URL) {
+        let base = folder.appendingPathComponent("transcript")
+        try AppDelegate.writeExports(base: base, segments: segments, names: [:])
+        let audio = try mixRecordings(in: folder, recordings: recordings)
+        return (audio, base)
     }
 
     static func mixRecordings(in folder: URL, recordings: [(url: URL, offset: Double)]) throws -> URL {

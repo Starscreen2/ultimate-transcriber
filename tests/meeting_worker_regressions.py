@@ -76,6 +76,18 @@ harness = r'''
         try require(Date().timeIntervalSince(finishStart) < 5, "A blocked input write hung finalization")
         try require(hung.failureWarning?.contains("preserved") == true, "The forced finish did not warn that audio was preserved")
 
+        var backlogWarnings = 0
+        let overloaded = LiveWhisperWorker(onWarning: { _ in backlogWarnings += 1 }) { _ in }
+        try overloaded.start(executable: hangs, model: model)
+        // Each packet contains two seconds of PCM. The fake engine never reads;
+        // filling the queue must warn exactly once rather than growing forever.
+        let packet = Array(repeating: Float(0.1), count: 32_000)
+        for _ in 0..<100 { overloaded.append(packet) }
+        try require(overloaded.failureWarning?.contains("fell behind") == true, "A stalled worker queued unbounded PCM")
+        overloaded.append(packet)
+        _ = await overloaded.finish(timeout: 0.1)
+        try require(backlogWarnings == 1, "Backlog warning repeated or never reached the UI")
+
         let loading = try script("loading", "while :; do :; done\n", in: folder)
         let control = OperationControl()
         let cancelled = LiveWhisperWorker { _ in }
@@ -84,7 +96,7 @@ harness = r'''
         do { try cancelled.start(executable: loading, model: model, control: control) }
         catch { cancelledFailed = true }
         try require(cancelledFailed && control.cancelled, "Cancelled loading did not release the ready wait")
-        print("Live-worker regression checks passed (normal, repeated finish, early exit, EPIPE, hung pipe, cancelled loading).")
+        print("Live-worker regression checks passed (normal, repeated finish, early exit, EPIPE, hung pipe, bounded backlog, cancelled loading).")
     }
 }
 '''

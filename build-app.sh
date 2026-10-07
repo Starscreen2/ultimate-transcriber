@@ -5,7 +5,7 @@ ROOT="$(cd "$(dirname "$0")" && pwd)"
 VENDOR="$ROOT/vendor/whisper.cpp"
 SHERPA="$ROOT/vendor/sherpa-onnx"
 LLAMA="$ROOT/vendor/llama.cpp"
-APP_DESTINATION="$ROOT/build/TranscribeToText.app"
+APP_DESTINATION="$ROOT/build/Transcribe to Text.app"
 
 if ! command -v cmake >/dev/null 2>&1; then
   echo "CMake is required. Install it with: brew install cmake" >&2
@@ -85,7 +85,7 @@ cmake --build "$SHERPA/build" --config Release --target sherpa-onnx-offline-spea
 # Assemble and verify a new bundle before replacing the installed build. A Swift
 # compilation or resource failure must leave the previous working app available.
 STAGING_ROOT="$(mktemp -d "$ROOT/build/.TranscribeToText-build.XXXXXX")"
-APP="$STAGING_ROOT/TranscribeToText.app"
+APP="$STAGING_ROOT/Transcribe to Text.app"
 cleanup_staging() {
   if [ -e "$STAGING_ROOT/Previous.app" ] && [ ! -e "$APP_DESTINATION" ]; then
     if ! mv "$STAGING_ROOT/Previous.app" "$APP_DESTINATION"; then
@@ -99,8 +99,8 @@ trap cleanup_staging EXIT
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 swiftc -parse-as-library -swift-version 5 -target arm64-apple-macos13.0 \
   -framework SwiftUI -framework AVFoundation -framework UniformTypeIdentifiers -framework AppKit \
-  -framework CoreAudio \
-  "$ROOT/TranscribeToText.swift" "$ROOT/MeetingCapture.swift" "$ROOT/LocalMeetingSummarizer.swift" \
+  -framework CoreAudio -framework ApplicationServices \
+  "$ROOT/TranscribeToText.swift" "$ROOT/MeetingCapture.swift" "$ROOT/LocalMeetingSummarizer.swift" "$ROOT/MeetingDetection.swift" \
   -o "$APP/Contents/MacOS/TranscribeToText"
 cp "$ROOT/build/meeting-whisper/bin/whisper-cli" "$APP/Contents/Resources/whisper-cli"
 cp "$ROOT/build/meeting-whisper/bin/meeting-whisper" "$APP/Contents/Resources/meeting-whisper"
@@ -154,7 +154,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundleDisplayName</key><string>Transcribe to Text</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
-  <key>CFBundleShortVersionString</key><string>0.2.0</string>
+  <key>CFBundleShortVersionString</key><string>0.3.1</string>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
   <key>NSMicrophoneUsageDescription</key><string>Transcribe to Text uses microphone audio to record and transcribe meetings on this Mac.</string>
   <key>NSAudioCaptureUsageDescription</key><string>Transcribe to Text captures audio playing through this Mac so it can transcribe and save meeting notes locally.</string>
@@ -163,6 +163,9 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 </dict>
 </plist>
 PLIST
+# Keep the certificate and designated requirement stable between rebuilds so
+# macOS can reuse microphone, system-audio and Accessibility approvals.
+python3 "$ROOT/scripts/sign-app.py" "$APP"
 if [ -e "$APP_DESTINATION" ]; then
   mv "$APP_DESTINATION" "$STAGING_ROOT/Previous.app"
 fi

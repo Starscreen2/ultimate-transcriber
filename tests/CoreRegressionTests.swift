@@ -101,8 +101,30 @@ struct CoreRegressionTests {
         expect(!files.fileExists(atPath: slow.path), "incomplete download persisted")
         expect(try files.contentsOfDirectory(atPath: root.path).allSatisfy { !$0.hasSuffix(".download") && !$0.hasPrefix(".exports-") }, "staging files leaked")
 
+        try testTranscriptRecovery(root: root)
         try testAudioOffsets(root: root)
         print("Passed \(checks) core regression checks")
+    }
+
+    static func testTranscriptRecovery(root: URL) throws {
+        let folder = root.appendingPathComponent("recovery")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let segments = [TranscriptSegment(start: 0.5, end: 1.5, text: "Captured text 会议", speakerID: nil)]
+        let broken = folder.appendingPathComponent("broken.caf")
+        try "invalid audio".write(to: broken, atomically: true, encoding: .utf8)
+        for recordings: [(url: URL, offset: Double)] in [[], [(broken, 0)]] {
+            expectFailure("audio failure should propagate") {
+                _ = try MeetingCaptureController.saveTranscriptAndMixRecordings(in: folder, segments: segments, recordings: recordings)
+            }
+            for ext in ["txt", "srt", "vtt"] {
+                let contents = try String(contentsOf: folder.appendingPathComponent("transcript." + ext), encoding: .utf8)
+                expect(contents.contains(segments[0].text), "audio finalization lost the captured \(ext) transcript")
+            }
+            let srt = try String(contentsOf: folder.appendingPathComponent("transcript.srt"), encoding: .utf8)
+            let recovered = AppDelegate.parseSRT(srt)
+            expect(recovered.count == 1 && recovered[0].start == 0.5 && recovered[0].end == 1.5 && recovered[0].text == segments[0].text, "recovered transcript timestamps changed")
+        }
+        expect(FileManager.default.fileExists(atPath: broken.path), "failed audio conversion removed its recovery source")
     }
 
     static func testAudioOffsets(root: URL) throws {
