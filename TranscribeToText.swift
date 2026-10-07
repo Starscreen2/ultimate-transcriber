@@ -166,7 +166,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
     private let transcribeButton = NSButton(title: "Transcribe", target: nil, action: nil)
     private let showResultsButton = NSButton(title: "Show Results", target: nil, action: nil)
     private let summaryButton = NSButton(title: "Generate Local Notes…", target: nil, action: nil)
-    private let stopMeetingButton = NSButton(title: "Stop Meeting", target: nil, action: nil)
+    private let meetingCaptureButton = NSButton(title: "Start Meeting", target: nil, action: nil)
     private let openRecordingsButton = NSButton(title: "Open Recordings", target: nil, action: nil)
     private let activityButton = NSButton(title: "Activity", target: nil, action: nil)
     private var activityWindow: NSWindow?
@@ -628,12 +628,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
     }
 
     private func updateMeetingCaptureControls() {
-        stopMeetingButton.isHidden = !meetingInProgress
-        stopMeetingButton.isEnabled = meetingInProgress && !meetingIsStopping
-        stopMeetingButton.title = meetingIsStopping ? "Saving Meeting…" : "Stop Meeting"
+        meetingCaptureButton.isHidden = false
+        meetingCaptureButton.isEnabled = !meetingIsStopping && !meetingIsPreparing &&
+            (meetingInProgress || (busyKind != .modelDownload && !isTerminating))
+        if meetingIsStopping { meetingCaptureButton.title = "Saving Meeting…" }
+        else if meetingIsPreparing { meetingCaptureButton.title = "Preparing Meeting…" }
+        else { meetingCaptureButton.title = meetingInProgress ? "Stop Meeting" : "Start Meeting" }
         openRecordingsButton.isEnabled = meetingRecordingsFolder != nil
         setBusyControls(isBusy)
         updateModelDownloadButton()
+    }
+
+    @objc private func meetingCaptureButtonClicked() {
+        if meetingInProgress { stopMeetingFromBadge() }
+        else { startMeetingFromBadge() }
     }
 
     @objc private func openMeetingSettings() {
@@ -902,11 +910,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
         transcribeButton.bezelStyle = .rounded
         transcribeButton.keyEquivalent = "\r"
         transcribeButton.isEnabled = false
-        stopMeetingButton.target = self
-        stopMeetingButton.action = #selector(stopMeetingFromBadge)
-        stopMeetingButton.bezelStyle = .rounded
-        stopMeetingButton.controlSize = .small
-        stopMeetingButton.isHidden = true
+        meetingCaptureButton.target = self
+        meetingCaptureButton.action = #selector(meetingCaptureButtonClicked)
+        meetingCaptureButton.bezelStyle = .rounded
+        meetingCaptureButton.controlSize = .small
         openRecordingsButton.target = self
         openRecordingsButton.action = #selector(openMeetingRecordings)
         openRecordingsButton.bezelStyle = .rounded
@@ -1018,13 +1025,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
          divider, modelCaption, modelPicker, modelDetail, languageCaption, languagePicker,
          customLanguage, speakerToggle, transcribeButton, spinner, showResultsButton, statusRow,
          summaryButton, downloadModelButton, speakerEditors, previewBox, transcriptScroll, speakerNote, footer,
-         stopMeetingButton, openRecordingsButton, activityButton, meetingSettingsButton, copyTranscriptButton,
+         meetingCaptureButton, openRecordingsButton, activityButton, meetingSettingsButton, copyTranscriptButton,
          exportTranscriptButton].forEach { root.addSubview($0) }
 
         [heading, subheading, inputBox, fileCaption, filename, filePath, chooseButton,
          divider, modelCaption, modelPicker, modelDetail, languageCaption, languagePicker,
          customLanguage, speakerToggle, transcribeButton, spinner, showResultsButton, statusRow,
-         summaryButton, downloadModelButton, speakerEditors, stopMeetingButton, openRecordingsButton, activityButton, meetingSettingsButton,
+         summaryButton, downloadModelButton, speakerEditors, meetingCaptureButton, openRecordingsButton, activityButton, meetingSettingsButton,
          statusIcon, status, previewBox, transcriptScroll, speakerNote, footer,
          copyTranscriptButton, exportTranscriptButton].forEach {
             $0.translatesAutoresizingMaskIntoConstraints = false
@@ -1047,8 +1054,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
             activityButton.centerYAnchor.constraint(equalTo: heading.centerYAnchor),
             openRecordingsButton.rightAnchor.constraint(equalTo: activityButton.leftAnchor, constant: -8),
             openRecordingsButton.centerYAnchor.constraint(equalTo: heading.centerYAnchor),
-            stopMeetingButton.rightAnchor.constraint(equalTo: openRecordingsButton.leftAnchor, constant: -8),
-            stopMeetingButton.centerYAnchor.constraint(equalTo: heading.centerYAnchor),
+            meetingCaptureButton.rightAnchor.constraint(equalTo: openRecordingsButton.leftAnchor, constant: -8),
+            meetingCaptureButton.centerYAnchor.constraint(equalTo: heading.centerYAnchor),
             subheading.leftAnchor.constraint(equalTo: heading.leftAnchor),
             subheading.topAnchor.constraint(equalTo: heading.bottomAnchor, constant: 4),
 
