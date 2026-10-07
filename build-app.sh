@@ -154,7 +154,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundleDisplayName</key><string>Transcribe to Text</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
-  <key>CFBundleShortVersionString</key><string>0.3.1</string>
+  <key>CFBundleShortVersionString</key><string>0.3.2</string>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
   <key>NSMicrophoneUsageDescription</key><string>Transcribe to Text uses microphone audio to record and transcribe meetings on this Mac.</string>
   <key>NSAudioCaptureUsageDescription</key><string>Transcribe to Text captures audio playing through this Mac so it can transcribe and save meeting notes locally.</string>
