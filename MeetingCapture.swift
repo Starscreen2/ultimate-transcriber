@@ -5,60 +5,130 @@ import Darwin
 
 final class InferenceJobQueue {
     static let shared = InferenceJobQueue()
-    typealias Job = (@escaping () -> Void) -> Void
+    enum Completion { case completed, paused, failed(String) }
+    typealias Job = (@escaping (Completion) -> Void) -> Void
+    private struct QueuedJob {
+        let id: UUID
+        let title: String
+        let job: Job
+        let preempt: (() -> Void)?
+    }
     private let lock = NSLock()
-    private var jobs: [Job] = []
-    private var running = false
+    private var jobs: [QueuedJob] = []
+    private var activeJob: QueuedJob?
+    private var priorityLeases: Set<UUID> = []
+    private var schedulingSuspendedForTermination = false
     var onIdle: (() -> Void)?
+    var onQuiescentForTermination: (() -> Void)?
 
     private init() {}
 
     var isBusy: Bool {
         lock.lock(); defer { lock.unlock() }
-        return running || !jobs.isEmpty
+        return activeJob != nil || !jobs.isEmpty || !priorityLeases.isEmpty
     }
 
-    func tryAcquire() -> Bool {
+    var canTerminateWithQueuedWork: Bool {
         lock.lock(); defer { lock.unlock() }
-        guard !running, jobs.isEmpty else { return false }
-        running = true
-        return true
+        return activeJob == nil && priorityLeases.isEmpty &&
+            (schedulingSuspendedForTermination || jobs.isEmpty)
     }
 
-    func enqueue(_ job: @escaping Job) {
+    func pausePendingWorkForTermination() {
         lock.lock()
-        jobs.append(job)
-        let shouldStart = !running
-        if shouldStart { running = true }
+        schedulingSuspendedForTermination = true
+        let preempt = activeJob?.preempt
+        let notify = activeJob == nil && priorityLeases.isEmpty ? onQuiescentForTermination : nil
         lock.unlock()
-        if shouldStart { startNext() }
+        preempt?()
+        if let notify { DispatchQueue.main.async(execute: notify) }
     }
 
-    func release() {
+    @discardableResult
+    func acquirePriorityLease() -> UUID {
+        let lease = UUID()
         lock.lock()
-        if jobs.isEmpty {
-            running = false
+        priorityLeases.insert(lease)
+        let preempt = activeJob?.preempt
+        lock.unlock()
+        preempt?()
+        return lease
+    }
+
+    func releasePriorityLease(_ lease: UUID) {
+        lock.lock()
+        priorityLeases.remove(lease)
+        lock.unlock()
+        startNextIfPossible()
+    }
+
+    func enqueue(id: UUID = UUID(), title: String, preempt: (() -> Void)? = nil, _ job: @escaping Job) {
+        lock.lock()
+        jobs.append(QueuedJob(id: id, title: title, job: job, preempt: preempt))
+        lock.unlock()
+        ActivityCenter.shared.update(id, state: .queued, detail: "Waiting for Whisper")
+        startNextIfPossible()
+    }
+
+    func enqueue(_ job: @escaping (@escaping () -> Void) -> Void) {
+        let id = UUID()
+        enqueue(id: id, title: "Whisper transcription") { finish in
+            job { finish(.completed) }
+        }
+    }
+
+    func cancel(_ id: UUID) {
+        lock.lock()
+        if let index = jobs.firstIndex(where: { $0.id == id }) {
+            jobs.remove(at: index)
+            lock.unlock()
+            ActivityCenter.shared.update(id, state: .failed, detail: "Canceled")
+            return
+        }
+        let active = activeJob?.id == id ? activeJob : nil
+        lock.unlock()
+        active?.preempt?()
+    }
+
+    private func startNextIfPossible() {
+        lock.lock()
+        if schedulingSuspendedForTermination {
+            let notify = activeJob == nil && priorityLeases.isEmpty ? onQuiescentForTermination : nil
+            lock.unlock()
+            if let notify { DispatchQueue.main.async(execute: notify) }
+            return
+        }
+        guard activeJob == nil, priorityLeases.isEmpty else { lock.unlock(); return }
+        guard !jobs.isEmpty else {
             let idle = onIdle
             lock.unlock()
             DispatchQueue.main.async { idle?() }
             return
         }
+        let task = jobs.removeFirst()
+        activeJob = task
         lock.unlock()
-        startNext()
+        ActivityCenter.shared.update(task.id, state: .running, detail: "Transcribing")
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            task.job { [weak self] completion in self?.finish(task, completion: completion) }
+        }
     }
 
-    private func startNext() {
+    private func finish(_ task: QueuedJob, completion: Completion) {
         lock.lock()
-        guard !jobs.isEmpty else {
-            running = false
-            lock.unlock()
-            return
-        }
-        let job = jobs.removeFirst()
+        guard activeJob?.id == task.id else { lock.unlock(); return }
+        activeJob = nil
+        if case .paused = completion { jobs.insert(task, at: 0) }
+        let notify = schedulingSuspendedForTermination && priorityLeases.isEmpty
+            ? onQuiescentForTermination : nil
         lock.unlock()
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            job { self?.release() }
+        switch completion {
+        case .completed: ActivityCenter.shared.update(task.id, state: .completed, detail: "Finished")
+        case .paused: ActivityCenter.shared.update(task.id, state: .paused, detail: "Paused for the active recording")
+        case .failed(let message): ActivityCenter.shared.update(task.id, state: .failed, detail: message)
         }
+        if let notify { DispatchQueue.main.async(execute: notify) }
+        else { startNextIfPossible() }
     }
 }
 
@@ -495,6 +565,7 @@ final class MeetingCaptureController: NSObject {
     private var preparingWorkers: [LiveWhisperWorker] = []
     private var stopRequested = false
     private var liveTranscriptionEnabled = false
+    private var priorityLeaseID: UUID?
 
     var active: Bool {
         stateLock.lock(); defer { stateLock.unlock() }
@@ -586,7 +657,7 @@ final class MeetingCaptureController: NSObject {
             .appendingPathComponent("ggml-large-v3-turbo.bin")
     }
 
-    func start(sessionID: UUID, liveTranscription: Bool, meetingsRoot: URL, includeMicrophone: Bool, includeSystemAudio: Bool,
+    func start(sessionID: UUID, priorityLeaseID: UUID, meetingsRoot: URL, includeMicrophone: Bool, includeSystemAudio: Bool,
                shouldBeginCapture: (() async -> Bool)? = nil) {
         stateLock.lock()
         guard !isActive, !isStarting, !isStopping else { stateLock.unlock(); return }
@@ -594,7 +665,8 @@ final class MeetingCaptureController: NSObject {
         stopRequested = false
         sessionFolder = nil
         self.sessionID = sessionID
-        liveTranscriptionEnabled = liveTranscription
+        self.priorityLeaseID = priorityLeaseID
+        liveTranscriptionEnabled = true
         let control = OperationControl()
         preparationControl = control
         stateLock.unlock()
@@ -611,7 +683,7 @@ final class MeetingCaptureController: NSObject {
                     return folder
                 }
                 updateState(active: false, starting: false, stopping: false)
-                if liveTranscription { InferenceJobQueue.shared.release() }
+                InferenceJobQueue.shared.releasePriorityLease(priorityLeaseID)
                 onStateChange?(sessionID, false)
                 let details = [error.localizedDescription, captureWarning()].compactMap { $0 }.joined(separator: " ")
                 onFailure?(sessionID, details, preservedFolder)
@@ -698,6 +770,9 @@ final class MeetingCaptureController: NSObject {
         try control.check()
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         sessionFolder = folder
+        ActivityCenter.shared.add(kind: .recording, title: folder.lastPathComponent,
+                                  state: .recording, detail: "Recording meeting audio", folderURL: folder,
+                                  id: startedSessionID)
 
         var microphoneWorker: LiveWhisperWorker?
         if canUseMicrophone && liveTranscriptionEnabled {
@@ -948,6 +1023,7 @@ final class MeetingCaptureController: NSObject {
 
     private func finishSession() async {
         let stoppingSessionID = sessionID
+        let finishingPriorityLeaseID = priorityLeaseID
         onStatus?(stoppingSessionID, "Finishing live transcription and saving the meeting…")
         audioEngine?.inputNode.removeTap(onBus: 0)
         audioEngine?.stop()
@@ -980,11 +1056,11 @@ final class MeetingCaptureController: NSObject {
                 try AppDelegate.writeExports(base: folder.appendingPathComponent("transcript"),
                                              segments: snapshot, names: [:])
             } catch {
-                stateLock.lock()
-                observedCaptureError = [observedCaptureError,
-                    "The transcript could not be saved immediately: \(error.localizedDescription)"]
-                    .compactMap { $0 }.joined(separator: " ")
-                stateLock.unlock()
+                stateLock.withLock {
+                    observedCaptureError = [observedCaptureError,
+                        "The transcript could not be saved immediately: \(error.localizedDescription)"]
+                        .compactMap { $0 }.joined(separator: " ")
+                }
             }
         }
 
@@ -1013,12 +1089,19 @@ final class MeetingCaptureController: NSObject {
                 let audio = try Self.mixRecordings(in: folder, recordings: recordings)
                 let transcriptModel = WhisperModel.choices.first(where: { $0.id == "large-v3-turbo" })
                     ?? WhisperModel.choices[0]
-                InferenceJobQueue.shared.enqueue { [weak self] finishJob in
-                    guard let self else { finishJob(); return }
+                ActivityCenter.shared.add(kind: .transcription, title: folder.lastPathComponent,
+                    state: .queued, detail: "Waiting for Whisper", sourceURL: audio, folderURL: folder,
+                    modelID: transcriptModel.id, language: "auto", detectSpeakers: true,
+                    outputBaseURL: folder.appendingPathComponent("transcript"), id: finishedSessionID)
+                let work = PreemptibleWorkState()
+                InferenceJobQueue.shared.enqueue(id: finishedSessionID, title: folder.lastPathComponent,
+                                                 preempt: { work.preempt() }) { [weak self] finishJob in
+                    guard let self else { finishJob(.failed("Meeting controller was closed")); return }
+                    let control = work.beginAttempt()
                     do {
                         let result = try AppDelegate.transcribe(
                             file: audio, model: transcriptModel, language: "auto", detectSpeakers: true,
-                            control: OperationControl(), progress: { [weak self] message in
+                            control: control, progress: { [weak self] message in
                                 self?.onStatus?(finishedSessionID, message)
                             }, liveTranscript: { _ in }, outputBaseOverride: folder.appendingPathComponent("transcript"))
                         let warnings = [sessionWarning, result.speakerWarning].compactMap { $0 }.joined(separator: " ")
@@ -1026,14 +1109,23 @@ final class MeetingCaptureController: NSObject {
                             audioFile: audio, transcriptBase: result.base, segments: result.segments,
                             speakerIDs: result.speakerIDs, speakerWarning: warnings.isEmpty ? nil : warnings))
                     } catch {
+                        if work.shouldRequeue {
+                            work.prepareForRetryAfterPreemption()
+                            ActivityCenter.shared.update(finishedSessionID, state: .paused,
+                                detail: "Paused for the active recording; will restart from saved audio")
+                            finishJob(.paused)
+                            return
+                        }
                         self.onFailure?(finishedSessionID,
                             "Meeting transcript failed. The recording remains saved: \(error.localizedDescription)", folder)
+                        finishJob(.failed(error.localizedDescription))
+                        return
                     }
-                    finishJob()
+                    finishJob(.completed)
                 }
-                if liveTranscriptionEnabled { InferenceJobQueue.shared.release() }
+            if let finishingPriorityLeaseID { InferenceJobQueue.shared.releasePriorityLease(finishingPriorityLeaseID) }
             } catch {
-                if liveTranscriptionEnabled { InferenceJobQueue.shared.release() }
+                if let finishingPriorityLeaseID { InferenceJobQueue.shared.releasePriorityLease(finishingPriorityLeaseID) }
                 onFailure?(finishedSessionID,
                     "Meeting audio could not be prepared for transcription: \(error.localizedDescription)", folder)
             }
@@ -1079,7 +1171,7 @@ final class MeetingCaptureController: NSObject {
             let details = [sessionWarning, error.localizedDescription].compactMap { $0 }.joined(separator: " ")
             onFailure?(finishedSessionID, "Meeting final processing failed. Saved files remain in the meeting folder: \(details)", folder)
         }
-        InferenceJobQueue.shared.release()
+        if let finishingPriorityLeaseID { InferenceJobQueue.shared.releasePriorityLease(finishingPriorityLeaseID) }
     }
 
     private func cleanupAfterFailedStart() async {
@@ -1145,6 +1237,8 @@ final class MeetingCaptureController: NSObject {
             throw AppError.message("FFmpeg is needed to finish the meeting recording. Install it with Homebrew and reopen the app.")
         }
         let output = folder.appendingPathComponent("audio.m4a")
+        let stagedOutput = folder.appendingPathComponent("audio-mix-\(UUID().uuidString).m4a")
+        defer { try? FileManager.default.removeItem(at: stagedOutput) }
         var arguments = ["-y"]
         var filters: [String] = []
         for (index, recording) in recordings.enumerated() {
@@ -1158,10 +1252,60 @@ final class MeetingCaptureController: NSObject {
         let inputs = recordings.indices.map { "[source\($0)]" }.joined()
         filters.append("\(inputs)amix=inputs=\(recordings.count):duration=longest:dropout_transition=0[audio]")
         arguments += ["-filter_complex", filters.joined(separator: ";"), "-map", "[audio]",
-                      "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", output.path]
+                      "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", stagedOutput.path]
         _ = try run(executable: ffmpeg, arguments: arguments)
+        try validateAudioHasSignal(stagedOutput)
+        if FileManager.default.fileExists(atPath: output.path) {
+            _ = try FileManager.default.replaceItemAt(output, withItemAt: stagedOutput)
+        } else {
+            try FileManager.default.moveItem(at: stagedOutput, to: output)
+        }
         for recording in recordings { try? FileManager.default.removeItem(at: recording.url) }
         return output
+    }
+
+    private static func validateAudioHasSignal(_ url: URL) throws {
+        let file = try AVAudioFile(forReading: url)
+        let format = file.processingFormat
+        guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 16_384) else {
+            throw AppError.message("The saved meeting audio could not be checked for sound.")
+        }
+        var peak: Float = 0
+        while file.framePosition < file.length {
+            let remaining = file.length - file.framePosition
+            try file.read(into: buffer, frameCount: AVAudioFrameCount(min(remaining, Int64(buffer.frameCapacity))))
+            let frames = Int(buffer.frameLength)
+            guard frames > 0 else { break }
+            let channels = Int(format.channelCount)
+            switch format.commonFormat {
+            case .pcmFormatFloat32:
+                guard let samples = buffer.floatChannelData else {
+                    throw AppError.message("The saved meeting audio could not be checked for sound.")
+                }
+                for channel in 0..<channels {
+                    for frame in 0..<frames { peak = max(peak, abs(samples[channel][frame])) }
+                }
+            case .pcmFormatInt16:
+                guard let samples = buffer.int16ChannelData else {
+                    throw AppError.message("The saved meeting audio could not be checked for sound.")
+                }
+                for channel in 0..<channels {
+                    for frame in 0..<frames { peak = max(peak, abs(Float(samples[channel][frame]) / Float(Int16.max))) }
+                }
+            case .pcmFormatInt32:
+                guard let samples = buffer.int32ChannelData else {
+                    throw AppError.message("The saved meeting audio could not be checked for sound.")
+                }
+                for channel in 0..<channels {
+                    for frame in 0..<frames { peak = max(peak, abs(Float(samples[channel][frame]) / Float(Int32.max))) }
+                }
+            default:
+                throw AppError.message("The saved meeting audio has an unsupported format and could not be checked for sound.")
+            }
+        }
+        guard peak > 0.00001 else {
+            throw AppError.message("The captured audio contains only silence. The original recording tracks were kept in this meeting folder; check microphone and system-audio access before recording again.")
+        }
     }
 
     private static func detectSpeakers(in audio: URL) async throws -> (turns: [TranscriptSegment], warning: String?) {

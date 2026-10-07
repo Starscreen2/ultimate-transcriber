@@ -1,4 +1,5 @@
 import AppKit
+import AVFoundation
 import UniformTypeIdentifiers
 import Darwin
 
@@ -167,6 +168,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
     private let summaryButton = NSButton(title: "Generate Local Notes…", target: nil, action: nil)
     private let stopMeetingButton = NSButton(title: "Stop Meeting", target: nil, action: nil)
     private let openRecordingsButton = NSButton(title: "Open Recordings", target: nil, action: nil)
+    private let activityButton = NSButton(title: "Activity", target: nil, action: nil)
+    private var activityWindow: NSWindow?
+    private let activityText = NSTextView()
     private let meetingSettingsButton = NSButton(title: "Meeting Settings…", target: nil, action: nil)
     private let microphoneCaptureToggle = NSButton(checkboxWithTitle: "Microphone", target: nil, action: nil)
     private let systemAudioCaptureToggle = NSButton(checkboxWithTitle: "System Audio", target: nil, action: nil)
@@ -199,11 +203,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
     private var summaryURL: URL?
     private var summaryGenerationID: UUID?
     private var activeSummaryOperation: OperationControl?
+    private var recoveringSummaryOperations: [UUID: OperationControl] = [:]
     private var meetingStatusItem: NSStatusItem?
     private let meetingController = MeetingCaptureController()
     private var activeMeetingSessionID = UUID()
     private var waitingForMeetingStopBeforeQuit = false
-    private var waitingForMeetingNotesBeforeQuit = false
     private var waitingForOperationBeforeQuit = false
     private var outputBase: URL?
     private var transcriptSegments: [TranscriptSegment] = []
@@ -213,8 +217,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
     private var previewContainer: NSBox?
     private var isBusy = false
     private var activeOperation: OperationControl?
+    private var activePreemptibleWork: PreemptibleWorkState?
+    private var activeTranscriptionID: UUID?
     private enum BusyKind { case transcription, modelDownload }
     private var busyKind: BusyKind?
+
+    private var hasActiveSummaryOperation: Bool {
+        activeSummaryOperation != nil || !recoveringSummaryOperations.isEmpty
+    }
 
     private enum TranscriptExportFormat: CaseIterable {
         case plainText
@@ -251,6 +261,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
         buildWindow()
         configureMeetingBadge()
         configureMeetingDetection()
+        ActivityCenter.shared.onChange = { [weak self] in
+            self?.refreshActivityWindow()
+            self?.updateModelDownloadButton()
+        }
+        refreshActivityWindow()
+        recoverQueuedTranscriptions()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -266,25 +282,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        if waitingForMeetingStopBeforeQuit || waitingForOperationBeforeQuit { return .terminateLater }
+        if isTerminating { return .terminateLater }
         closeDetectionPrompt()
-        if let operation = activeOperation ?? activeSummaryOperation {
+        let queue = InferenceJobQueue.shared
+        if meetingController.inProgress {
+            waitingForMeetingStopBeforeQuit = true
             waitingForOperationBeforeQuit = true
-            operation.cancel()
-            setBusyControls(isBusy)
+            queue.pausePendingWorkForTermination()
+            if let summaryID = summaryGenerationID, activeSummaryOperation != nil {
+                ActivityCenter.shared.update(summaryID, state: .paused, detail: "Paused because the app is closing; it will resume next time")
+                activeSummaryOperation?.cancel()
+            }
+            for (summaryID, operation) in recoveringSummaryOperations {
+                ActivityCenter.shared.update(summaryID, state: .paused,
+                    detail: "Paused because the app is closing; it will resume next time")
+                operation.cancel()
+            }
+            meetingIsStopping = true
             updateMeetingBadgeMenu()
+            updateMeetingCaptureControls()
+            meetingController.stop()
             return .terminateLater
         }
-        guard meetingController.inProgress else {
-            guard InferenceJobQueue.shared.isBusy else { return .terminateNow }
-            waitingForOperationBeforeQuit = true
-            return .terminateLater
+        guard activeOperation != nil || hasActiveSummaryOperation || queue.isBusy else { return .terminateNow }
+        waitingForOperationBeforeQuit = true
+        queue.pausePendingWorkForTermination()
+        if let summaryID = summaryGenerationID, activeSummaryOperation != nil {
+            ActivityCenter.shared.update(summaryID, state: .paused, detail: "Paused because the app is closing; it will resume next time")
+            activeSummaryOperation?.cancel()
+        } else if activePreemptibleWork == nil {
+            activeOperation?.cancel()
         }
-        waitingForMeetingStopBeforeQuit = true
-        meetingIsStopping = true
+        for (summaryID, operation) in recoveringSummaryOperations {
+            ActivityCenter.shared.update(summaryID, state: .paused,
+                detail: "Paused because the app is closing; it will resume next time")
+            operation.cancel()
+        }
+        setBusyControls(isBusy)
         updateMeetingBadgeMenu()
-        updateMeetingCaptureControls()
-        meetingController.stop()
+        tryReplyToTermination()
         return .terminateLater
     }
 
@@ -300,18 +336,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
         waitingForOperationBeforeQuit || waitingForMeetingStopBeforeQuit
     }
 
-    private func replyToQuitWhenInferenceIsDone() {
-        if InferenceJobQueue.shared.isBusy {
-            waitingForOperationBeforeQuit = true
-        } else {
-            NSApp.reply(toApplicationShouldTerminate: true)
-        }
+    private func tryReplyToTermination() {
+        guard isTerminating, activeOperation == nil, !hasActiveSummaryOperation,
+              !meetingController.inProgress,
+              InferenceJobQueue.shared.canTerminateWithQueuedWork else { return }
+        waitingForMeetingStopBeforeQuit = false
+        waitingForOperationBeforeQuit = false
+        NSApp.reply(toApplicationShouldTerminate: true)
     }
 
     private func clearMeetingNotes() {
-        activeSummaryOperation?.cancel()
-        activeSummaryOperation = nil
-        summaryGenerationID = nil
         summaryURL = nil
         meetingResult = nil
         summaryButton.isHidden = true
@@ -342,12 +376,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
 
     private func configureMeetingBadge() {
         InferenceJobQueue.shared.onIdle = { [weak self] in
-            guard let self, self.waitingForOperationBeforeQuit,
-                  !InferenceJobQueue.shared.isBusy, self.activeOperation == nil,
-                  self.activeSummaryOperation == nil, !self.meetingController.inProgress else { return }
-            self.waitingForOperationBeforeQuit = false
-            NSApp.reply(toApplicationShouldTerminate: true)
+            self?.tryReplyToTermination()
         }
+        InferenceJobQueue.shared.onQuiescentForTermination = { [weak self] in self?.tryReplyToTermination() }
         meetingStatusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         meetingStatusItem?.button?.image = NSImage(systemSymbolName: "waveform", accessibilityDescription: "Meeting Capture")
         meetingStatusItem?.button?.toolTip = "Meeting Capture"
@@ -379,6 +410,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
         }
         meetingController.onCaptureStopped = { [weak self] sessionID in
             DispatchQueue.main.async {
+                ActivityCenter.shared.update(sessionID, state: .running, detail: "Recording saved; finishing transcript")
                 guard let self, self.activeMeetingSessionID == sessionID else { return }
                 self.meetingIsPreparing = false
                 self.meetingIsActive = false
@@ -400,6 +432,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
         }
         meetingController.onFinished = { [weak self] result in
             DispatchQueue.main.async {
+                ActivityCenter.shared.update(result.sessionID, state: .completed, detail: "Transcript saved")
                 guard let self, self.activeMeetingSessionID == result.sessionID else { return }
                 self.meetingIsPreparing = false
                 self.meetingIsActive = false
@@ -426,18 +459,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
                 }
                 self.updateMeetingBadgeMenu()
                 self.updateMeetingCaptureControls()
-                if LocalMeetingSummarizer.isModelInstalled {
-                    self.waitingForMeetingNotesBeforeQuit = self.waitingForMeetingStopBeforeQuit
+                if LocalMeetingSummarizer.isModelInstalled && !self.isTerminating {
                     self.generateMeetingNotes()
                 }
-                if self.waitingForMeetingStopBeforeQuit && !self.waitingForMeetingNotesBeforeQuit {
-                    self.waitingForMeetingStopBeforeQuit = false
-                    self.replyToQuitWhenInferenceIsDone()
-                }
+                if self.waitingForMeetingStopBeforeQuit { self.tryReplyToTermination() }
             }
         }
         meetingController.onFailure = { [weak self] sessionID, message, preservedFolder in
             DispatchQueue.main.async {
+                ActivityCenter.shared.update(sessionID, state: .failed, detail: message)
                 guard let self, self.activeMeetingSessionID == sessionID else { return }
                 self.meetingIsPreparing = false
                 self.meetingIsActive = false
@@ -451,7 +481,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
                 self.updateMeetingCaptureControls()
                 if self.waitingForMeetingStopBeforeQuit {
                     self.waitingForMeetingStopBeforeQuit = false
-                    self.replyToQuitWhenInferenceIsDone()
+                    self.tryReplyToTermination()
                 }
             }
         }
@@ -468,7 +498,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
         let startTitle = meetingIsPreparing ? "Preparing Meeting…" : "Start Meeting"
         let start = NSMenuItem(title: startTitle, action: #selector(startMeetingFromBadge), keyEquivalent: "")
         start.target = self
-        start.isEnabled = !meetingInProgress && (!isBusy || busyKind == .transcription) && !isTerminating
+        start.isEnabled = !meetingInProgress && busyKind != .modelDownload && !isTerminating
         menu.addItem(start)
 
         let stop = NSMenuItem(title: meetingIsStopping ? "Finishing Meeting…" : "Stop Meeting",
@@ -514,7 +544,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
     }
 
     @objc private func startMeetingFromBadge() {
-        guard !meetingInProgress, (!isBusy || busyKind == .transcription), !isTerminating else { return }
+        guard !meetingInProgress, busyKind != .modelDownload, !isTerminating else { return }
         closeDetectionPrompt()
         guard meetingMicrophoneEnabled || (meetingSystemAudioEnabled && supportsSystemAudioCapture) else {
             status.stringValue = "Turn on at least one available audio source in Meeting Settings."
@@ -544,6 +574,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
         openingTracker.claimAll()
         closeDetectionPrompt()
         meetingIsPreparing = true
+        activeTranscriptionID = nil
         clearMeetingNotes()
         resultFolder = nil
         showResultsButton.isHidden = true
@@ -567,11 +598,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
         }
         let sessionID = UUID()
         activeMeetingSessionID = sessionID
-        let liveTranscription = InferenceJobQueue.shared.tryAcquire()
-        if !liveTranscription {
-            status.stringValue = "Whisper is busy. Recording will start now, and its transcript will wait in the queue."
-        }
-        meetingController.start(sessionID: sessionID, liveTranscription: liveTranscription, meetingsRoot: folder,
+        let priorityLeaseID = InferenceJobQueue.shared.acquirePriorityLease()
+        ActivityCenter.shared.add(kind: .recording, title: folder.lastPathComponent,
+                                  state: .recording, detail: "Starting recording", folderURL: folder, id: sessionID)
+        meetingController.start(sessionID: sessionID, priorityLeaseID: priorityLeaseID, meetingsRoot: folder,
                                 includeMicrophone: meetingMicrophoneEnabled,
                                 includeSystemAudio: meetingSystemAudioEnabled && supportsSystemAudioCapture,
                                 shouldBeginCapture: detectedMeeting.map { signal in
@@ -740,9 +770,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
     }
 
     @objc private func generateMeetingNotes() {
-        guard let result = meetingResult, activeSummaryOperation == nil, !meetingInProgress, !isBusy else { return }
+        guard let result = meetingResult, !hasActiveSummaryOperation, !meetingInProgress, !isBusy else { return }
         let generationID = UUID()
         let operation = OperationControl()
+        let summaryFolder = result.folder
+        ActivityCenter.shared.add(kind: .summary, title: summaryFolder.lastPathComponent,
+                                  state: .running, detail: "Generating local meeting notes",
+                                  folderURL: summaryFolder, id: generationID)
         summaryGenerationID = generationID
         activeSummaryOperation = operation
         summaryButton.isEnabled = false
@@ -753,12 +787,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
                                         progress: { [weak self] message in
             DispatchQueue.main.async {
                 guard let self, self.summaryGenerationID == generationID else { return }
-                self.status.stringValue = message
+                if self.resultFolder?.standardizedFileURL == summaryFolder.standardizedFileURL {
+                    self.status.stringValue = message
+                }
             }
         }, completion: { [weak self] completion in
             guard let self, self.summaryGenerationID == generationID else { return }
+            switch completion {
+            case .success: ActivityCenter.shared.update(generationID, state: .completed, detail: "Meeting notes saved")
+            case .failure(let error):
+                let pausedForQuit = self.isTerminating && operation.isCancelled
+                ActivityCenter.shared.update(generationID, state: pausedForQuit ? .paused : .failed,
+                    detail: pausedForQuit ? "Paused because the app is closing; it will resume next time" : error.localizedDescription)
+            }
             self.activeSummaryOperation = nil
             self.updateModelDownloadButton()
+            guard self.resultFolder?.standardizedFileURL == summaryFolder.standardizedFileURL else {
+                self.tryReplyToTermination()
+                return
+            }
             self.summaryButton.isEnabled = true
             switch completion {
             case .success(let url):
@@ -771,12 +818,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
                 self.summaryButton.action = #selector(self.generateMeetingNotes)
                 self.status.stringValue = "Meeting audio and transcript are saved. Notes could not be generated: \(error.localizedDescription)"
             }
-            if self.waitingForMeetingNotesBeforeQuit || self.waitingForOperationBeforeQuit {
-                self.waitingForMeetingNotesBeforeQuit = false
-                self.waitingForMeetingStopBeforeQuit = false
-                self.waitingForOperationBeforeQuit = false
-                self.replyToQuitWhenInferenceIsDone()
-            }
+            self.tryReplyToTermination()
         })
     }
 
@@ -827,12 +869,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
     }
 
     private func buildWindow() {
-        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 820, height: 700),
+        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 960, height: 780),
                           styleMask: [.titled, .closable, .miniaturizable, .resizable],
                           backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false
         window.title = "Transcribe to Text"
-        window.minSize = NSSize(width: 720, height: 700)
+        window.minSize = NSSize(width: 800, height: 680)
         window.center()
 
         filename.font = .boldSystemFont(ofSize: 14)
@@ -871,6 +913,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
         openRecordingsButton.controlSize = .small
         openRecordingsButton.isEnabled = meetingRecordingsFolder != nil
         openRecordingsButton.toolTip = "Open the folder containing all saved meeting sessions"
+        activityButton.target = self
+        activityButton.action = #selector(openActivity)
+        activityButton.bezelStyle = .rounded
+        activityButton.controlSize = .small
+        activityButton.toolTip = "View recordings, transcription, and notes activity"
         meetingSettingsButton.target = self
         meetingSettingsButton.action = #selector(openMeetingSettings)
         meetingSettingsButton.bezelStyle = .rounded
@@ -960,8 +1007,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
         speakerNote.maximumNumberOfLines = 2
         speakerNote.lineBreakMode = .byTruncatingTail
         let footer = NSTextField(labelWithString: "Exports TXT, SRT, and VTT beside the source file. Media stays on this Mac.")
-        footer.font = .systemFont(ofSize: 10)
-        footer.textColor = .tertiaryLabelColor
+        footer.font = .systemFont(ofSize: 11)
+        footer.textColor = .secondaryLabelColor
+        footer.stringValue = "Exports are saved beside the source file."
+        speakerNote.stringValue = "Speaker labels are estimates. Rename them above; exports update automatically."
 
         window.contentView = NSView()
         let root = window.contentView!
@@ -969,13 +1018,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
          divider, modelCaption, modelPicker, modelDetail, languageCaption, languagePicker,
          customLanguage, speakerToggle, transcribeButton, spinner, showResultsButton, statusRow,
          summaryButton, downloadModelButton, speakerEditors, previewBox, transcriptScroll, speakerNote, footer,
-         stopMeetingButton, openRecordingsButton, meetingSettingsButton, copyTranscriptButton,
+         stopMeetingButton, openRecordingsButton, activityButton, meetingSettingsButton, copyTranscriptButton,
          exportTranscriptButton].forEach { root.addSubview($0) }
 
         [heading, subheading, inputBox, fileCaption, filename, filePath, chooseButton,
          divider, modelCaption, modelPicker, modelDetail, languageCaption, languagePicker,
          customLanguage, speakerToggle, transcribeButton, spinner, showResultsButton, statusRow,
-         summaryButton, downloadModelButton, speakerEditors, stopMeetingButton, openRecordingsButton, meetingSettingsButton,
+         summaryButton, downloadModelButton, speakerEditors, stopMeetingButton, openRecordingsButton, activityButton, meetingSettingsButton,
          statusIcon, status, previewBox, transcriptScroll, speakerNote, footer,
          copyTranscriptButton, exportTranscriptButton].forEach {
             $0.translatesAutoresizingMaskIntoConstraints = false
@@ -994,7 +1043,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
             heading.topAnchor.constraint(equalTo: root.topAnchor, constant: 18),
             meetingSettingsButton.rightAnchor.constraint(equalTo: root.rightAnchor, constant: -24),
             meetingSettingsButton.centerYAnchor.constraint(equalTo: heading.centerYAnchor),
-            openRecordingsButton.rightAnchor.constraint(equalTo: meetingSettingsButton.leftAnchor, constant: -8),
+            activityButton.rightAnchor.constraint(equalTo: meetingSettingsButton.leftAnchor, constant: -8),
+            activityButton.centerYAnchor.constraint(equalTo: heading.centerYAnchor),
+            openRecordingsButton.rightAnchor.constraint(equalTo: activityButton.leftAnchor, constant: -8),
             openRecordingsButton.centerYAnchor.constraint(equalTo: heading.centerYAnchor),
             stopMeetingButton.rightAnchor.constraint(equalTo: openRecordingsButton.leftAnchor, constant: -8),
             stopMeetingButton.centerYAnchor.constraint(equalTo: heading.centerYAnchor),
@@ -1151,11 +1202,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
             downloadModelButton.toolTip = "Cancel the download of \(selected.id)."
         } else if WhisperModel.isInstalled(at: selected.localURL) {
             downloadModelButton.title = "Delete Model"
-            downloadModelButton.isEnabled = activeOperation == nil && activeSummaryOperation == nil && !meetingInProgress && !isTerminating
+            downloadModelButton.isEnabled = activeOperation == nil && !hasActiveSummaryOperation &&
+                !meetingInProgress && !isTerminating && !InferenceJobQueue.shared.isBusy
             downloadModelButton.toolTip = "Delete the downloaded \(selected.id) model from this Mac."
         } else {
             downloadModelButton.title = "Download Model (\(selected.downloadSize))"
-            downloadModelButton.isEnabled = activeOperation == nil && activeSummaryOperation == nil && !meetingInProgress && !isTerminating
+            downloadModelButton.isEnabled = activeOperation == nil && !hasActiveSummaryOperation &&
+                !meetingInProgress && !isTerminating && !InferenceJobQueue.shared.isBusy
             downloadModelButton.toolTip = "Download \(selected.id). Transcribe will also download it automatically if needed."
         }
     }
@@ -1165,7 +1218,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
             downloadSelectedModel()
             return
         }
-        guard activeOperation == nil, activeSummaryOperation == nil, !meetingInProgress, !isTerminating else { return }
+        guard activeOperation == nil, !hasActiveSummaryOperation, !meetingInProgress, !isTerminating,
+              !InferenceJobQueue.shared.isBusy else { return }
         let model = WhisperModel.choices[min(max(modelPicker.indexOfSelectedItem, 0), WhisperModel.choices.count - 1)]
         guard WhisperModel.isInstalled(at: model.localURL) else {
             downloadSelectedModel()
@@ -1197,7 +1251,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
             operation.cancel()
             return
         }
-        guard activeOperation == nil, activeSummaryOperation == nil, !meetingInProgress, !isTerminating else { return }
+        guard activeOperation == nil, !hasActiveSummaryOperation, !meetingInProgress, !isTerminating,
+              !InferenceJobQueue.shared.isBusy else { return }
         let model = WhisperModel.choices[min(max(modelPicker.indexOfSelectedItem, 0), WhisperModel.choices.count - 1)]
         if WhisperModel.isInstalled(at: model.localURL) {
             updateModelDownloadButton()
@@ -1357,6 +1412,197 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
         if let meetingRecordingsFolder { NSWorkspace.shared.open(meetingRecordingsFolder) }
     }
 
+    @objc private func openActivity() {
+        if activityWindow == nil {
+            let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 520, height: 420),
+                                styleMask: [.titled, .closable, .miniaturizable, .resizable],
+                                backing: .buffered, defer: false)
+            panel.title = "Activity"
+            panel.isReleasedWhenClosed = false
+            let scroll = NSScrollView()
+            scroll.hasVerticalScroller = true
+            scroll.autohidesScrollers = true
+            activityText.frame = NSRect(x: 0, y: 0, width: 480, height: 400)
+            activityText.isEditable = false
+            activityText.isSelectable = true
+            activityText.isVerticallyResizable = true
+            activityText.isHorizontallyResizable = false
+            activityText.autoresizingMask = [.width]
+            activityText.font = .systemFont(ofSize: 13)
+            activityText.textContainerInset = NSSize(width: 12, height: 12)
+            activityText.textContainer?.containerSize = NSSize(width: 480, height: CGFloat.greatestFiniteMagnitude)
+            activityText.textContainer?.widthTracksTextView = true
+            scroll.documentView = activityText
+            panel.contentView = scroll
+            activityWindow = panel
+        }
+        refreshActivityWindow()
+        activityWindow?.center()
+        activityWindow?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    private func refreshActivityWindow() {
+        guard activityWindow != nil else { return }
+        let items = ActivityCenter.shared.snapshot
+        if items.isEmpty {
+            let empty = NSMutableAttributedString(string: "No recent activity\n", attributes: [
+                .font: NSFont.systemFont(ofSize: 16, weight: .semibold),
+                .foregroundColor: NSColor.labelColor
+            ])
+            empty.append(NSAttributedString(string: "Recordings, transcriptions, and meeting notes will appear here.",
+                attributes: [.font: NSFont.systemFont(ofSize: 13), .foregroundColor: NSColor.secondaryLabelColor]))
+            activityText.textStorage?.setAttributedString(empty)
+            return
+        }
+        let content = NSMutableAttributedString()
+        for (index, item) in items.enumerated() {
+            let state: String
+            let color: NSColor
+            switch item.state {
+            case .recording: state = "RECORDING"; color = .systemRed
+            case .queued: state = "QUEUED"; color = .systemOrange
+            case .running: state = "IN PROGRESS"; color = .controlAccentColor
+            case .paused: state = "PAUSED"; color = .systemOrange
+            case .completed: state = "FINISHED"; color = .systemGreen
+            case .failed: state = "NEEDS ATTENTION"; color = .systemRed
+            case .interrupted: state = "INTERRUPTED"; color = .systemOrange
+            }
+            let statusRangeStart = content.length
+            content.append(NSAttributedString(string: "●  \(state)  ", attributes: [
+                .font: NSFont.systemFont(ofSize: 10, weight: .bold), .foregroundColor: color
+            ]))
+            let titleStart = content.length
+            content.append(NSAttributedString(string: "\(item.kind.title) · \(item.title)\n", attributes: [
+                .font: NSFont.systemFont(ofSize: 14, weight: .semibold), .foregroundColor: NSColor.labelColor
+            ]))
+            content.addAttribute(.paragraphStyle, value: activityParagraphStyle(spacing: 3),
+                                 range: NSRange(location: statusRangeStart, length: content.length - statusRangeStart))
+            if !item.detail.isEmpty {
+                content.append(NSAttributedString(string: "  \(item.detail)\n", attributes: [
+                    .font: NSFont.systemFont(ofSize: 12), .foregroundColor: NSColor.secondaryLabelColor,
+                    .paragraphStyle: activityParagraphStyle(spacing: 8)
+                ]))
+            }
+            content.addAttribute(.paragraphStyle, value: activityParagraphStyle(spacing: 8),
+                                 range: NSRange(location: titleStart, length: content.length - titleStart))
+            if index < items.count - 1 {
+                content.append(NSAttributedString(string: "\n", attributes: [
+                    .font: NSFont.systemFont(ofSize: 5), .foregroundColor: NSColor.separatorColor
+                ]))
+            }
+        }
+        activityText.textStorage?.setAttributedString(content)
+    }
+
+    private func activityParagraphStyle(spacing: CGFloat) -> NSParagraphStyle {
+        let style = NSMutableParagraphStyle()
+        style.lineSpacing = 2
+        style.paragraphSpacing = spacing
+        return style
+    }
+
+    private func recoverQueuedTranscriptions() {
+        let center = ActivityCenter.shared
+        for item in center.unrecoverableItems() {
+            center.update(item.id, state: .failed, detail: "The saved audio or transcript could not be found, so this task cannot resume.")
+        }
+        for item in center.interruptedRecordings() {
+            guard let folder = item.folderURL, FileManager.default.fileExists(atPath: folder.path) else {
+                center.update(item.id, state: .failed, detail: "The interrupted recording folder could not be found.")
+                continue
+            }
+            let recoveredAudio = folder.appendingPathComponent("audio.m4a")
+            let files = (try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil)) ?? []
+            let recordings = files.filter { ["microphone.caf", "meeting-audio.caf"].contains($0.lastPathComponent) }
+                .map { (url: $0, offset: 0.0) }
+            guard !recordings.isEmpty || FileManager.default.fileExists(atPath: recoveredAudio.path) else {
+                center.update(item.id, state: .failed, detail: "Recording was interrupted before recoverable audio was saved.")
+                continue
+            }
+            center.update(item.id, state: .interrupted, detail: "Recovering saved audio after an interrupted recording")
+            DispatchQueue.global(qos: .utility).async {
+                do {
+                    let audio: URL
+                    if !recordings.isEmpty {
+                        // The source files are removed only after a successful mix. If they
+                        // remain, an audio.m4a may be a partial output from a forced shutdown.
+                        audio = try MeetingCaptureController.mixRecordings(in: folder, recordings: recordings)
+                    } else {
+                        let recoveredFile = try AVAudioFile(forReading: recoveredAudio)
+                        guard recoveredFile.length > 0 else {
+                            throw AppError.message("The recovered meeting audio is empty.")
+                        }
+                        audio = recoveredAudio
+                    }
+                    let model = WhisperModel.choices.first(where: { $0.id == "large-v3-turbo" }) ?? WhisperModel.choices[0]
+                    center.add(kind: .transcription, title: folder.lastPathComponent, state: .queued,
+                               detail: "Recovered audio; waiting for Whisper", sourceURL: audio, folderURL: folder,
+                               modelID: model.id, language: "auto", detectSpeakers: true,
+                               outputBaseURL: folder.appendingPathComponent("transcript"), id: item.id)
+                } catch {
+                    center.update(item.id, state: .failed, detail: "Saved audio could not be recovered: \(error.localizedDescription)")
+                }
+            }
+        }
+
+        for item in center.recoverableItems() {
+            if item.kind == .summary {
+                guard let folder = item.folderURL,
+                      let data = try? Data(contentsOf: folder.appendingPathComponent("transcript.srt")),
+                      let text = String(data: data, encoding: .utf8) else { continue }
+                let segments = Self.parseSRT(text)
+                guard !segments.isEmpty else { center.update(item.id, state: .failed, detail: "Saved transcript could not be read"); continue }
+                let control = OperationControl()
+                recoveringSummaryOperations[item.id] = control
+                center.update(item.id, state: .running, detail: "Resuming meeting notes")
+                updateModelDownloadButton()
+                LocalMeetingSummarizer.generate(folder: folder, segments: segments, names: [:], control: control,
+                    progress: { _ in }, completion: { result in
+                        DispatchQueue.main.async {
+                            self.recoveringSummaryOperations.removeValue(forKey: item.id)
+                            switch result {
+                            case .success: center.update(item.id, state: .completed, detail: "Meeting notes saved")
+                            case .failure(let error):
+                                let pausedForQuit = self.isTerminating && control.isCancelled
+                                center.update(item.id, state: pausedForQuit ? .paused : .failed,
+                                    detail: pausedForQuit ? "Paused because the app is closing; it will resume next time" : error.localizedDescription)
+                            }
+                            self.updateModelDownloadButton()
+                            self.setBusyControls(self.isBusy)
+                            self.tryReplyToTermination()
+                        }
+                    })
+                continue
+            }
+            guard let file = item.sourceURL else { continue }
+            let model = WhisperModel.choices.first(where: { $0.id == item.modelID }) ?? WhisperModel.choices[0]
+            let language = item.language ?? "auto"
+            let detectSpeakers = item.detectSpeakers ?? false
+            let work = PreemptibleWorkState()
+            center.update(item.id, state: .queued, detail: "Restored after app restart; waiting for Whisper")
+            InferenceJobQueue.shared.enqueue(id: item.id, title: item.title, preempt: { work.preempt() }) { finish in
+                let control = work.beginAttempt()
+                do {
+                    _ = try Self.transcribe(file: file, model: model, language: language,
+                        detectSpeakers: detectSpeakers, control: control, progress: { _ in }, liveTranscript: { _ in },
+                        outputBaseOverride: item.outputBasePath.map(URL.init(fileURLWithPath:)))
+                    center.update(item.id, state: .completed, detail: "Transcript saved")
+                    finish(.completed)
+                } catch {
+                    if work.shouldRequeue {
+                        work.prepareForRetryAfterPreemption()
+                        center.update(item.id, state: .paused, detail: "Paused for an active recording")
+                        finish(.paused)
+                    } else {
+                        center.update(item.id, state: .failed, detail: error.localizedDescription)
+                        finish(.failed(error.localizedDescription))
+                    }
+                }
+            }
+        }
+    }
+
     @objc private func openAppFromBadge() {
         if window.isMiniaturized { window.deminiaturize(nil) }
         window.makeKeyAndOrderFront(nil)
@@ -1364,11 +1610,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
     }
 
     @objc private func transcriptionButtonClicked() {
-        if busyKind == .transcription, let operation = activeOperation {
+        if busyKind == .transcription, let work = activePreemptibleWork, let taskID = activeTranscriptionID {
             transcribeButton.title = "Canceling…"
             transcribeButton.isEnabled = false
             status.stringValue = "Cancelling transcription…"
-            operation.cancel()
+            work.cancel()
+            InferenceJobQueue.shared.cancel(taskID)
+            if activeOperation == nil { finishBusy() }
             return
         }
         startTranscription()
@@ -1379,8 +1627,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
         clearMeetingNotes()
         resultFolder = nil
         showResultsButton.isHidden = true
-        let operation = OperationControl()
-        activeOperation = operation
+        let taskID = UUID()
+        let work = PreemptibleWorkState()
+        activeTranscriptionID = taskID
+        activePreemptibleWork = work
+        activeOperation = nil
         busyKind = .transcription
         isBusy = true
         setBusyControls(true)
@@ -1403,65 +1654,93 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
         let codes = ["auto", "en", "es", "fr", "de", "zh", "ja", "ko"]
         let customCode = customLanguage.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let lang = model.id.hasSuffix(".en") ? "en" : (langIndex == 8 ? (customCode.isEmpty ? "auto" : customCode) : codes[max(0, min(langIndex, 7))])
-        let reportProgress: (String) -> Void = { message in
+        ActivityCenter.shared.add(kind: .transcription, title: file.lastPathComponent, state: .queued,
+            detail: "Waiting for Whisper", sourceURL: file, modelID: model.id, language: lang,
+            detectSpeakers: detectSpeakers, id: taskID)
+        status.stringValue = "Queued for transcription. It will start when Whisper is available…"
+        InferenceJobQueue.shared.enqueue(id: taskID, title: file.lastPathComponent,
+            preempt: { work.preempt() }) { [weak self] finishJob in
+            guard let self else { finishJob(.failed("The app window was closed")); return }
+            let operation = work.beginAttempt()
             DispatchQueue.main.async {
-                guard self.activeOperation === operation, !operation.isCancelled else { return }
-                self.status.stringValue = message
+                if self.activeTranscriptionID == taskID {
+                    self.activeOperation = operation
+                    self.status.stringValue = "Preparing the local Whisper model…"
+                }
             }
-        }
-
-        let queuedBehindAnotherJob = InferenceJobQueue.shared.isBusy
-        if queuedBehindAnotherJob {
-            status.stringValue = "Queued for transcription. It will start when the current Whisper job finishes…"
-        }
-        InferenceJobQueue.shared.enqueue { finishJob in
+            let reportProgress: (String) -> Void = { message in
+                DispatchQueue.main.async {
+                    guard self.activeTranscriptionID == taskID, !operation.isCancelled else { return }
+                    self.status.stringValue = message
+                }
+            }
             do {
                 let result = try Self.transcribe(file: file, model: model, language: lang,
-                                                 detectSpeakers: detectSpeakers, control: operation, progress: reportProgress,
-                                                 liveTranscript: { segments in
-                    DispatchQueue.main.async {
-                        guard self.activeOperation === operation, !operation.isCancelled else { return }
-                        self.transcriptSegments = segments
-                        self.transcript.string = Self.renderTranscript(segments, names: [:])
+                    detectSpeakers: detectSpeakers, control: operation, progress: reportProgress,
+                    liveTranscript: { segments in
+                        DispatchQueue.main.async {
+                            guard self.activeTranscriptionID == taskID, !operation.isCancelled else { return }
+                            self.transcriptSegments = segments
+                            self.transcript.string = Self.renderTranscript(segments, names: [:])
+                            self.transcript.textColor = .labelColor
+                            self.transcript.scrollRangeToVisible(NSRange(location: self.transcript.string.utf16.count, length: 0))
+                            self.updateTranscriptActionButtons()
+                        }
+                    })
+                ActivityCenter.shared.update(taskID, state: .completed, detail: "Transcript saved")
+                DispatchQueue.main.async {
+                    guard self.activePreemptibleWork === work else { return }
+                    if self.activeTranscriptionID == taskID {
+                        self.transcriptSegments = result.segments
+                        self.speakerNames = Dictionary(uniqueKeysWithValues: result.speakerIDs.enumerated().map { ($1, "Speaker \($0 + 1)") })
+                        self.outputBase = result.base
+                        self.updateSpeakerEditors()
+                        self.transcript.string = Self.renderTranscript(result.segments, names: self.speakerNames)
                         self.transcript.textColor = .labelColor
-                        self.transcript.scrollRangeToVisible(NSRange(location: self.transcript.string.utf16.count, length: 0))
                         self.updateTranscriptActionButtons()
+                        self.resultFolder = result.folder
+                        self.showResultsButton.isHidden = false
+                        if let warning = result.speakerWarning {
+                            self.status.stringValue = "Transcript saved, but speaker detection could not run: \(warning)"
+                        } else if result.speakerIDs.isEmpty && detectSpeakers {
+                            self.status.stringValue = "Transcription saved. No distinct speakers were confidently detected."
+                        } else if detectSpeakers {
+                            self.status.stringValue = "Done. Identified \(result.speakerIDs.count) speakers and saved TXT, SRT, and VTT."
+                        } else {
+                            self.status.stringValue = "Done. Saved TXT, SRT, and VTT next to the source file."
+                        }
                     }
-                })
-                DispatchQueue.main.async {
-                    guard self.activeOperation === operation else { return }
-                    self.transcriptSegments = result.segments
-                    self.speakerNames = Dictionary(uniqueKeysWithValues: result.speakerIDs.enumerated().map { ($1, "Speaker \($0 + 1)") })
-                    self.outputBase = result.base
-                    self.updateSpeakerEditors()
-                    self.transcript.string = Self.renderTranscript(result.segments, names: self.speakerNames)
-                    self.transcript.textColor = .labelColor
-                    self.updateTranscriptActionButtons()
-                    self.resultFolder = result.folder
-                    self.showResultsButton.isHidden = false
-                    if let warning = result.speakerWarning {
-                        self.status.stringValue = "Transcript saved, but speaker detection could not run: \(warning)"
-                    } else if result.speakerIDs.isEmpty && detectSpeakers {
-                        self.status.stringValue = "Transcription saved. No distinct speakers were confidently detected."
-                    } else if detectSpeakers {
-                        self.status.stringValue = "Done. Identified \(result.speakerIDs.count) speakers and saved TXT, SRT, and VTT."
-                    } else {
-                        self.status.stringValue = "Done. Saved TXT, SRT, and VTT next to the source file."
-                    }
-                    self.finish()
+                    self.finishBusy()
                 }
+                finishJob(.completed)
             } catch {
-                DispatchQueue.main.async {
-                    guard self.activeOperation === operation else { return }
-                    if operation.isCancelled || error as? AppError == .cancelled {
-                        self.status.stringValue = "Transcription cancelled. Any text already shown remains in the preview; exports were not updated."
-                    } else {
-                        self.status.stringValue = "Transcription failed: \(error.localizedDescription)"
+                if work.shouldRequeue {
+                    work.prepareForRetryAfterPreemption()
+                    ActivityCenter.shared.update(taskID, state: .paused, detail: "Paused for the active recording; will restart from saved audio")
+                    DispatchQueue.main.async {
+                        guard self.activePreemptibleWork === work else { return }
+                        if self.activeTranscriptionID == taskID {
+                            self.status.stringValue = "Paused for the active recording. This transcription will resume afterward."
+                        }
+                        self.finishBusy()
                     }
-                    self.finish()
+                    finishJob(.paused)
+                } else {
+                    let canceled = work.isCanceledByUser || operation.isCancelled || (error as? AppError == .cancelled)
+                    ActivityCenter.shared.update(taskID, state: canceled ? .failed : .failed,
+                                                 detail: canceled ? "Canceled" : error.localizedDescription)
+                    DispatchQueue.main.async {
+                        guard self.activePreemptibleWork === work else { return }
+                        if self.activeTranscriptionID == taskID {
+                            self.status.stringValue = canceled
+                                ? "Transcription cancelled. Any text already shown remains in the preview; exports were not updated."
+                                : "Transcription failed: \(error.localizedDescription)"
+                        }
+                        self.finishBusy()
+                    }
+                    finishJob(.failed(canceled ? "Canceled" : error.localizedDescription))
                 }
             }
-            finishJob()
         }
     }
 
@@ -1474,9 +1753,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
         customLanguage.isEnabled = !blocked
         speakerToggle.isEnabled = !blocked
         transcribeButton.isEnabled = busyKind == .transcription
-            ? activeOperation?.isCancelled == false : !blocked && selectedFile != nil
+            ? activePreemptibleWork != nil && activeOperation?.isCancelled != true && !isTerminating
+            : !blocked && selectedFile != nil
         downloadModelButton.isEnabled = !blocked
-        if activeSummaryOperation == nil { summaryButton.isEnabled = meetingResult != nil && !blocked }
+        if !hasActiveSummaryOperation { summaryButton.isEnabled = meetingResult != nil && !blocked }
     }
 
     private func finish() {
@@ -1486,16 +1766,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
     private func finishBusy() {
         isBusy = false
         activeOperation = nil
+        activePreemptibleWork = nil
+        activeTranscriptionID = nil
         busyKind = nil
         transcribeButton.title = "Transcribe"
         setBusyControls(false)
         modelChanged()
         spinner.stopAnimation(nil)
         updateMeetingBadgeMenu()
-        if waitingForOperationBeforeQuit && !InferenceJobQueue.shared.isBusy {
-            waitingForOperationBeforeQuit = false
-            NSApp.reply(toApplicationShouldTerminate: true)
-        }
+        tryReplyToTermination()
     }
 
     private func caption(_ text: String) -> NSTextField {
@@ -2037,7 +2316,7 @@ extension AppDelegate {
 
     private func processOpeningReminders() {
         guard detectionMode != .manual, !isTerminating, !meetingInProgress, !isBusy,
-              activeSummaryOperation == nil, detectionPanel == nil,
+              !hasActiveSummaryOperation, detectionPanel == nil,
               let opening = openingTracker.opportunities(now: ProcessInfo.processInfo.systemUptime).first(where: {
                   enabledDetectionPlatforms.contains($0.platform) &&
                       (detectionMode == .remind || !$0.platform.supportsAutomaticCapture)
@@ -2075,7 +2354,7 @@ extension AppDelegate {
             ?? "Choose recordings folder…"
         detectionFolderButton.isEnabled = !meetingInProgress && !isTerminating
         detectionModelButton.isEnabled = !WhisperModel.isInstalled(at: MeetingCaptureController.turboModelURL) &&
-            !isBusy && activeSummaryOperation == nil && !meetingInProgress && !isTerminating
+            !isBusy && !hasActiveSummaryOperation && !meetingInProgress && !isTerminating
         detectionModelButton.title = WhisperModel.isInstalled(at: MeetingCaptureController.turboModelURL)
             ? "Meeting model downloaded" : "Download meeting model (about 1.6 GB)"
         let added = additionalDetectionApplications.values.sorted() + additionalDetectionHosts.sorted()

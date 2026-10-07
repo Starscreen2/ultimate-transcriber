@@ -100,7 +100,7 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 swiftc -parse-as-library -swift-version 5 -target arm64-apple-macos13.0 \
   -framework SwiftUI -framework AVFoundation -framework UniformTypeIdentifiers -framework AppKit \
   -framework CoreAudio -framework ApplicationServices \
-  "$ROOT/TranscribeToText.swift" "$ROOT/MeetingCapture.swift" "$ROOT/LocalMeetingSummarizer.swift" "$ROOT/MeetingDetection.swift" \
+  "$ROOT/TranscribeToText.swift" "$ROOT/ActivityCenter.swift" "$ROOT/MeetingCapture.swift" "$ROOT/LocalMeetingSummarizer.swift" "$ROOT/MeetingDetection.swift" \
   -o "$APP/Contents/MacOS/TranscribeToText"
 cp "$ROOT/build/meeting-whisper/bin/whisper-cli" "$APP/Contents/Resources/whisper-cli"
 cp "$ROOT/build/meeting-whisper/bin/meeting-whisper" "$APP/Contents/Resources/meeting-whisper"

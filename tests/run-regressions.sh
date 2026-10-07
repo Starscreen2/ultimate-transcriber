@@ -9,7 +9,7 @@ TEMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/transcriber-tests.XXXXXX")"
 trap 'rm -rf "$TEMP_ROOT"' EXIT
 SWIFT_FLAGS=(-DREGRESSION_TESTS -parse-as-library -swift-version 5 -target arm64-apple-macos13.0
   -framework AppKit -framework AVFoundation -framework CoreAudio -framework ApplicationServices -framework UniformTypeIdentifiers)
-SWIFT_SOURCES=(TranscribeToText.swift MeetingCapture.swift LocalMeetingSummarizer.swift MeetingDetection.swift)
+SWIFT_SOURCES=(TranscribeToText.swift ActivityCenter.swift MeetingCapture.swift LocalMeetingSummarizer.swift MeetingDetection.swift)
 swiftc "${SWIFT_FLAGS[@]}" "${SWIFT_SOURCES[@]}" tests/CoreRegressionTests.swift -o "$TEMP_ROOT/core-regressions"
 swiftc "${SWIFT_FLAGS[@]}" "${SWIFT_SOURCES[@]}" tests/MeetingDetectionTests.swift -o "$TEMP_ROOT/detection-regressions"
 "$TEMP_ROOT/detection-regressions"
