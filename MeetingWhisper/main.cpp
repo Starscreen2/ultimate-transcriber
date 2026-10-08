@@ -1,4 +1,5 @@
 #include "whisper.h"
+#include "audio_gate.h"
 
 #include <algorithm>
 #include <charconv>
@@ -51,6 +52,7 @@ bool emitChunk(whisper_context * context, whisper_full_params parameters,
                const std::vector<float> & samples, const double offsetSeconds,
                const double minimumLocalStart) {
     if (samples.empty()) return true;
+    if (!meeting_whisper::hasSpeechLevelEnergy(samples.data(), samples.size())) return true;
     if (whisper_full(context, parameters, samples.data(), static_cast<int>(samples.size())) != 0) {
         std::cerr << "Whisper could not process a live audio chunk.\n";
         return false;

@@ -37,7 +37,7 @@ elif tool == "python3":
     if not args[0].endswith("scripts/sign-app.py"):
         sys.exit(1)
 elif tool == "mv":
-    if os.environ.get("FAIL_REPLACEMENT") == "1" and "/.TranscribeToText-build." in args[0] and args[0].endswith("/TranscribeToText.app"):
+    if os.environ.get("FAIL_REPLACEMENT") == "1" and "/.TranscribeToText-build." in args[0] and args[0].endswith("/Transcribe to Text.app"):
         sys.exit(1)
     sys.exit(subprocess.call(["/bin/mv", *args]))
 elif tool != "lipo":
@@ -50,7 +50,7 @@ class BuildPackagingTests(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory(prefix="build-packaging-tests-")
         self.addCleanup(temporary.cleanup)
         fixture = pathlib.Path(temporary.name)
-        app = fixture / "build/TranscribeToText.app"
+        app = fixture / "build/Transcribe to Text.app"
         app.mkdir(parents=True)
         (app / "sentinel").write_text("existing working app")
         for file in ("build/meeting-whisper/bin/whisper-cli",
@@ -72,7 +72,7 @@ class BuildPackagingTests(unittest.TestCase):
                             "PATH": str(mock_bin) + os.pathsep + environment["PATH"], **overrides})
         prelude = '''set -euo pipefail
 ROOT="$FIXTURE_ROOT"
-APP_DESTINATION="$ROOT/build/TranscribeToText.app"
+APP_DESTINATION="$ROOT/build/Transcribe to Text.app"
 LLAMA="$ROOT/vendor/llama.cpp"
 SHERPA="$ROOT/vendor/sherpa-onnx"
 '''

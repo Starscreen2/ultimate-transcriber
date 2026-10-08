@@ -9,9 +9,13 @@ TEMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/transcriber-tests.XXXXXX")"
 trap 'rm -rf "$TEMP_ROOT"' EXIT
 SWIFT_FLAGS=(-DREGRESSION_TESTS -parse-as-library -swift-version 5 -target arm64-apple-macos13.0
   -framework AppKit -framework AVFoundation -framework CoreAudio -framework ApplicationServices -framework UniformTypeIdentifiers)
-SWIFT_SOURCES=(TranscribeToText.swift ActivityCenter.swift MeetingCapture.swift LocalMeetingSummarizer.swift MeetingDetection.swift)
+TEST_MACOS_SDK="$(xcrun --sdk macosx --show-sdk-path)"
+SWIFT_SOURCES=(TranscribeToText.swift BatchTranscription.swift ActivityCenter.swift MeetingCapture.swift LocalMeetingSummarizer.swift MeetingDetection.swift)
 swiftc "${SWIFT_FLAGS[@]}" "${SWIFT_SOURCES[@]}" tests/CoreRegressionTests.swift -o "$TEMP_ROOT/core-regressions"
 swiftc "${SWIFT_FLAGS[@]}" "${SWIFT_SOURCES[@]}" tests/MeetingDetectionTests.swift -o "$TEMP_ROOT/detection-regressions"
+"${CXX:-c++}" -std=c++17 -isystem"$TEST_MACOS_SDK/usr/include/c++/v1" \
+  tests/meeting_whisper_audio_gate.cpp -o "$TEMP_ROOT/audio-gate-regressions"
+"$TEMP_ROOT/audio-gate-regressions"
 "$TEMP_ROOT/detection-regressions"
 "$TEMP_ROOT/core-regressions"
 swiftc "${SWIFT_FLAGS[@]}" "${SWIFT_SOURCES[@]}" tests/summary-regressions.swift -o "$TEMP_ROOT/summary-regressions"
@@ -24,7 +28,7 @@ swiftc "${SWIFT_FLAGS[@]}" "${SWIFT_SOURCES[@]}" tests/summary-regressions.swift
 if [[ " $* " == *" --real-model "* ]]; then
   SMOKE_APP="$TEMP_ROOT/FileSmoke.app"
   mkdir -p "$SMOKE_APP/Contents/MacOS"
-  ln -s "$ROOT/build/TranscribeToText.app/Contents/Resources" "$SMOKE_APP/Contents/Resources"
+  ln -s "$ROOT/build/Transcribe to Text.app/Contents/Resources" "$SMOKE_APP/Contents/Resources"
   cat > "$SMOKE_APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

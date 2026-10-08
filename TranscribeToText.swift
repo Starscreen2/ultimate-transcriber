@@ -153,6 +153,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
     private let filename = NSTextField(labelWithString: "No file selected")
     private let filePath = NSTextField(labelWithString: "Audio/video is converted and transcribed locally")
     private let chooseButton = NSButton(title: "Choose File…", target: nil, action: nil)
+    private let batchButton = NSButton(title: "Batch…", target: nil, action: nil)
     private let modelPicker = NSPopUpButton(frame: .zero, pullsDown: false)
     private let modelDetail = NSTextField(wrappingLabelWithString: "")
     private let downloadModelButton = NSButton(title: "Download Model", target: nil, action: nil)
@@ -219,8 +220,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
     private var activeOperation: OperationControl?
     private var activePreemptibleWork: PreemptibleWorkState?
     private var activeTranscriptionID: UUID?
-    private enum BusyKind { case transcription, modelDownload }
+    private enum BusyKind { case transcription, batchTranscription, modelDownload }
     private var busyKind: BusyKind?
+    private var batchPanel: BatchTranscriptionPanelController?
+    private var batchItems: [BatchTranscriptionItem] = []
+    private var batchWorks: [UUID: PreemptibleWorkState] = [:]
+    private var batchResults: [UUID: BatchTranscriptionResult] = [:]
+    private var batchSettings: BatchTranscriptionSettings?
+    private var batchHasStarted = false
+    private var activeBatchItemID: UUID?
+    private var activeBatchProgress = ""
 
     private var hasActiveSummaryOperation: Bool {
         activeSummaryOperation != nil || !recoveringSummaryOperations.isEmpty
@@ -473,6 +482,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
                 self.meetingIsActive = false
                 self.meetingIsStopping = false
                 self.status.stringValue = message
+                if message.localizedCaseInsensitiveContains("no usable audio signal") {
+                    self.meetingResult = nil
+                    self.outputBase = nil
+                    self.transcriptSegments = []
+                    self.speakerNames = [:]
+                    self.transcript.string = "No transcript was saved because no usable audio signal was captured. The original audio tracks remain in the meeting folder."
+                    self.transcript.textColor = .secondaryLabelColor
+                    self.updateSpeakerEditors()
+                    self.updateTranscriptActionButtons()
+                }
                 if let preservedFolder {
                     self.resultFolder = preservedFolder
                     self.showResultsButton.isHidden = false
@@ -905,6 +924,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
 
         chooseButton.target = self
         chooseButton.action = #selector(chooseFile)
+        batchButton.target = self
+        batchButton.action = #selector(openBatchTranscription)
+        batchButton.bezelStyle = .rounded
+        batchButton.toolTip = "Queue several audio or video files for sequential transcription"
         transcribeButton.target = self
         transcribeButton.action = #selector(transcriptionButtonClicked)
         transcribeButton.bezelStyle = .rounded
@@ -1021,14 +1044,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
 
         window.contentView = NSView()
         let root = window.contentView!
-        [heading, subheading, inputBox, fileCaption, filename, filePath, chooseButton,
+        [heading, subheading, inputBox, fileCaption, filename, filePath, chooseButton, batchButton,
          divider, modelCaption, modelPicker, modelDetail, languageCaption, languagePicker,
          customLanguage, speakerToggle, transcribeButton, spinner, showResultsButton, statusRow,
          summaryButton, downloadModelButton, speakerEditors, previewBox, transcriptScroll, speakerNote, footer,
          meetingCaptureButton, openRecordingsButton, activityButton, meetingSettingsButton, copyTranscriptButton,
          exportTranscriptButton].forEach { root.addSubview($0) }
 
-        [heading, subheading, inputBox, fileCaption, filename, filePath, chooseButton,
+        [heading, subheading, inputBox, fileCaption, filename, filePath, chooseButton, batchButton,
          divider, modelCaption, modelPicker, modelDetail, languageCaption, languagePicker,
          customLanguage, speakerToggle, transcribeButton, spinner, showResultsButton, statusRow,
          summaryButton, downloadModelButton, speakerEditors, meetingCaptureButton, openRecordingsButton, activityButton, meetingSettingsButton,
@@ -1068,10 +1091,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
             filename.leftAnchor.constraint(equalTo: fileCaption.rightAnchor, constant: 12),
             filename.centerYAnchor.constraint(equalTo: fileCaption.centerYAnchor),
             filename.rightAnchor.constraint(lessThanOrEqualTo: chooseButton.leftAnchor, constant: -12),
-            chooseButton.rightAnchor.constraint(equalTo: inputBox.rightAnchor, constant: -16),
+            chooseButton.widthAnchor.constraint(equalToConstant: 112),
+            chooseButton.rightAnchor.constraint(equalTo: batchButton.leftAnchor, constant: -8),
             chooseButton.centerYAnchor.constraint(equalTo: fileCaption.centerYAnchor),
+            batchButton.widthAnchor.constraint(equalToConstant: 78),
+            batchButton.rightAnchor.constraint(equalTo: inputBox.rightAnchor, constant: -16),
+            batchButton.centerYAnchor.constraint(equalTo: fileCaption.centerYAnchor),
             filePath.leftAnchor.constraint(equalTo: fileCaption.leftAnchor),
-            filePath.rightAnchor.constraint(equalTo: chooseButton.rightAnchor),
+            filePath.rightAnchor.constraint(equalTo: batchButton.rightAnchor),
             filePath.topAnchor.constraint(equalTo: fileCaption.bottomAnchor, constant: 4),
 
             divider.leftAnchor.constraint(equalTo: fileCaption.leftAnchor),
@@ -1187,6 +1214,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
 
     @objc private func languageChanged() {
         customLanguage.isHidden = languagePicker.indexOfSelectedItem != 8
+        updateBatchPanel()
     }
 
     @objc private func modelChanged() {
@@ -1199,6 +1227,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
         languagePicker.isEnabled = !isBusy && !meetingInProgress && !selected.id.hasSuffix(".en")
         languageChanged()
         updateModelDownloadButton()
+        updateBatchPanel()
     }
 
     private func updateModelDownloadButton() {
@@ -1309,6 +1338,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
         } else {
             status.stringValue = "Speaker detection is off. The transcript will contain words and timestamps only."
         }
+        updateBatchPanel()
     }
 
     func controlTextDidEndEditing(_ notification: Notification) {
@@ -1473,6 +1503,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
             case .paused: state = "PAUSED"; color = .systemOrange
             case .completed: state = "FINISHED"; color = .systemGreen
             case .failed: state = "NEEDS ATTENTION"; color = .systemRed
+            case .cancelled: state = "CANCELED"; color = .secondaryLabelColor
             case .interrupted: state = "INTERRUPTED"; color = .systemOrange
             }
             let statusRangeStart = content.length
@@ -1616,6 +1647,314 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
         NSApp.activate(ignoringOtherApps: true)
     }
 
+    @objc private func openBatchTranscription() {
+        guard !meetingInProgress, !isTerminating else { return }
+        let panel = makeBatchPanelIfNeeded()
+        updateBatchPanel()
+        panel.show()
+    }
+
+    private func makeBatchPanelIfNeeded() -> BatchTranscriptionPanelController {
+        if let batchPanel { return batchPanel }
+        let panel = BatchTranscriptionPanelController()
+        panel.onAddFiles = { [weak self] urls in self?.addBatchFiles(urls) }
+        panel.onRemoveFiles = { [weak self] ids in self?.removeBatchFiles(ids) }
+        panel.onStart = { [weak self] in self?.startBatchTranscription() }
+        panel.onCancelCurrent = { [weak self] in self?.cancelCurrentBatchItem() }
+        panel.onCancelRemaining = { [weak self] in self?.cancelRemainingBatchItems() }
+        panel.onRetryFailed = { [weak self] in self?.retryFailedBatchItems() }
+        panel.onOpenOutput = { [weak self] id in self?.openBatchOutput(for: id) }
+        panel.onSelectResult = { [weak self] id in self?.showBatchResult(for: id) }
+        panel.onNewBatch = { [weak self] in self?.resetBatch() }
+        batchPanel = panel
+        return panel
+    }
+
+    private func updateBatchPanel() {
+        batchPanel?.update(items: batchItems, activeItemID: activeBatchItemID,
+                           hasStarted: batchHasStarted, settings: batchSettings ?? selectedTranscriptionSettings())
+    }
+
+    private func addBatchFiles(_ urls: [URL]) {
+        guard !batchHasStarted, !isTerminating else { return }
+        batchItems = BatchTranscriptionPlan.makeItems(for: batchItems.map(\.sourceURL) + urls)
+        updateBatchPanel()
+    }
+
+    private func removeBatchFiles(_ ids: [UUID]) {
+        guard !batchHasStarted else { return }
+        let removing = Set(ids)
+        let remaining = batchItems.filter { !removing.contains($0.id) }.map(\.sourceURL)
+        batchItems = BatchTranscriptionPlan.makeItems(for: remaining)
+        updateBatchPanel()
+    }
+
+    private func selectedTranscriptionSettings() -> BatchTranscriptionSettings {
+        let model = WhisperModel.choices[min(max(modelPicker.indexOfSelectedItem, 0), WhisperModel.choices.count - 1)]
+        let languageIndex = languagePicker.indexOfSelectedItem
+        let codes = ["auto", "en", "es", "fr", "de", "zh", "ja", "ko"]
+        let customCode = customLanguage.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let language = model.id.hasSuffix(".en") ? "en" :
+            (languageIndex == 8 ? (customCode.isEmpty ? "auto" : customCode) : codes[max(0, min(languageIndex, 7))])
+        return BatchTranscriptionSettings(model: model, language: language,
+                                          detectSpeakers: speakerToggle.state == .on)
+    }
+
+    private func startBatchTranscription() {
+        guard !batchHasStarted, !batchItems.isEmpty, !isBusy, !meetingInProgress, !isTerminating else { return }
+        clearMeetingNotes()
+        batchHasStarted = true
+        batchSettings = selectedTranscriptionSettings()
+        batchResults.removeAll()
+        batchWorks.removeAll()
+        isBusy = true
+        busyKind = .batchTranscription
+        activeBatchProgress = ""
+        transcript.string = "Batch queued. Select a finished file in the batch window to view its transcript."
+        transcript.textColor = .secondaryLabelColor
+        transcriptSegments = []
+        speakerNames = [:]
+        outputBase = nil
+        resultFolder = nil
+        showResultsButton.isHidden = true
+        updateSpeakerEditors()
+        updateTranscriptActionButtons()
+        spinner.startAnimation(nil)
+        status.stringValue = "Preparing batch transcription…"
+        setBusyControls(true)
+        updateMeetingBadgeMenu()
+
+        guard let settings = batchSettings else { return }
+        let readyIDs = batchItems.filter { $0.state == .ready }.map(\.id)
+        for id in readyIDs { enqueueBatchItem(id, settings: settings) }
+        updateBatchPanel()
+        finishBatchIfDone()
+    }
+
+    private func enqueueBatchItem(_ id: UUID, settings: BatchTranscriptionSettings) {
+        guard let index = batchItems.firstIndex(where: { $0.id == id }) else { return }
+        let item = batchItems[index]
+        var isDirectory = ObjCBool(false)
+        guard FileManager.default.fileExists(atPath: item.sourceURL.path, isDirectory: &isDirectory), !isDirectory.boolValue else {
+            let message = "The selected media file could not be found."
+            batchItems[index].state = .failed
+            batchItems[index].detail = message
+            ActivityCenter.shared.add(kind: .transcription, title: item.sourceURL.lastPathComponent,
+                state: .failed, detail: message, sourceURL: item.sourceURL, modelID: settings.model.id,
+                language: settings.language, detectSpeakers: settings.detectSpeakers,
+                outputBaseURL: item.outputBaseURL, id: item.id)
+            updateBatchPanel()
+            return
+        }
+
+        batchItems[index].state = .queued
+        batchItems[index].detail = item.outputBaseURL.lastPathComponent == item.sourceURL.deletingPathExtension().lastPathComponent
+            ? "Waiting for Whisper" : "Waiting · exports as \(item.outputBaseURL.lastPathComponent)"
+        let work = PreemptibleWorkState()
+        batchWorks[id] = work
+        ActivityCenter.shared.add(kind: .transcription, title: item.sourceURL.lastPathComponent,
+            state: .queued, detail: "Waiting for Whisper", sourceURL: item.sourceURL,
+            modelID: settings.model.id, language: settings.language,
+            detectSpeakers: settings.detectSpeakers, outputBaseURL: item.outputBaseURL, id: id)
+
+        InferenceJobQueue.shared.enqueue(id: id, title: item.sourceURL.lastPathComponent,
+            preempt: { work.preempt() }) { [weak self] finishJob in
+            guard let self else { finishJob(.failed("The app window was closed")); return }
+            let operation = work.beginAttempt()
+            DispatchQueue.main.sync { self.batchJobDidStart(id, operation: operation, work: work) }
+            do {
+                try operation.check()
+                let result = try Self.transcribe(file: item.sourceURL, model: settings.model,
+                    language: settings.language, detectSpeakers: settings.detectSpeakers,
+                    control: operation,
+                    progress: { [weak self] message in
+                        DispatchQueue.main.async { self?.batchJobDidProgress(id, message: message) }
+                    },
+                    liveTranscript: { _ in }, outputBaseOverride: item.outputBaseURL)
+                let saved = BatchTranscriptionResult(folder: result.folder, base: result.base,
+                    segments: result.segments, speakerIDs: result.speakerIDs, speakerWarning: result.speakerWarning)
+                DispatchQueue.main.sync {
+                    self.batchJobDidComplete(id, result: saved)
+                    finishJob(.completed)
+                }
+            } catch {
+                if work.shouldRequeue {
+                    work.prepareForRetryAfterPreemption()
+                    DispatchQueue.main.sync {
+                        self.batchJobDidPause(id)
+                        finishJob(.paused)
+                    }
+                } else {
+                    let cancelled = work.isCanceledByUser || operation.isCancelled || (error as? AppError == .cancelled)
+                    DispatchQueue.main.sync {
+                        self.batchJobDidFail(id, message: cancelled ? "Canceled" : error.localizedDescription,
+                                             cancelled: cancelled)
+                        finishJob(cancelled ? .cancelled : .failed(error.localizedDescription))
+                    }
+                }
+            }
+        }
+        updateBatchPanel()
+    }
+
+    private func batchJobDidStart(_ id: UUID, operation: OperationControl, work: PreemptibleWorkState) {
+        guard let index = batchItems.firstIndex(where: { $0.id == id }) else { return }
+        guard batchItems[index].state != .cancelled else { return }
+        batchItems[index].state = .running
+        batchItems[index].detail = "Starting…"
+        activeBatchItemID = id
+        activeOperation = operation
+        activePreemptibleWork = work
+        activeTranscriptionID = id
+        busyKind = .batchTranscription
+        activeBatchProgress = "Starting…"
+        spinner.startAnimation(nil)
+        status.stringValue = batchProgressStatus(for: id, message: activeBatchProgress)
+        setBusyControls(true)
+        updateMeetingBadgeMenu()
+        updateBatchPanel()
+    }
+
+    private func batchJobDidProgress(_ id: UUID, message: String) {
+        guard activeBatchItemID == id,
+              let index = batchItems.firstIndex(where: { $0.id == id }) else { return }
+        activeBatchProgress = message
+        batchItems[index].detail = message
+        status.stringValue = batchProgressStatus(for: id, message: message)
+        updateBatchPanel()
+    }
+
+    private func batchProgressStatus(for id: UUID, message: String) -> String {
+        let position = (batchItems.firstIndex(where: { $0.id == id }) ?? 0) + 1
+        let name = batchItems.first(where: { $0.id == id })?.sourceURL.lastPathComponent ?? "file"
+        return "Batch · file \(position) of \(batchItems.count): \(name) — \(message)"
+    }
+
+    private func clearActiveBatchItem(_ id: UUID) {
+        guard activeBatchItemID == id else { return }
+        activeBatchItemID = nil
+        activeBatchProgress = ""
+        activeOperation = nil
+        activePreemptibleWork = nil
+        activeTranscriptionID = nil
+        spinner.stopAnimation(nil)
+        updateMeetingBadgeMenu()
+    }
+
+    private func batchJobDidComplete(_ id: UUID, result: BatchTranscriptionResult) {
+        guard let index = batchItems.firstIndex(where: { $0.id == id }) else { return }
+        batchResults[id] = result
+        batchItems[index].state = .completed
+        batchItems[index].detail = result.speakerWarning.map { "Saved · \($0)" }
+            ?? "Saved TXT, SRT, and WebVTT"
+        ActivityCenter.shared.update(id, state: .completed, detail: "Transcript saved")
+        clearActiveBatchItem(id)
+        status.stringValue = "Finished \(batchItems[index].sourceURL.lastPathComponent). " + BatchTranscriptionPlan.summary(for: batchItems)
+        updateBatchPanel()
+        finishBatchIfDone()
+    }
+
+    private func batchJobDidPause(_ id: UUID) {
+        guard let index = batchItems.firstIndex(where: { $0.id == id }) else { return }
+        batchItems[index].state = .paused
+        batchItems[index].detail = "Paused; will resume after the active recording"
+        ActivityCenter.shared.update(id, state: .paused, detail: "Paused for an active recording")
+        clearActiveBatchItem(id)
+        status.stringValue = isTerminating
+            ? "Pausing batch for app shutdown…"
+            : "Paused for an active recording. Batch transcription will resume afterward."
+        updateBatchPanel()
+        setBusyControls(isBusy)
+        tryReplyToTermination()
+    }
+
+    private func batchJobDidFail(_ id: UUID, message: String, cancelled: Bool) {
+        guard let index = batchItems.firstIndex(where: { $0.id == id }) else { return }
+        batchItems[index].state = cancelled ? .cancelled : .failed
+        batchItems[index].detail = cancelled ? "Canceled" : message
+        ActivityCenter.shared.update(id, state: cancelled ? .cancelled : .failed, detail: batchItems[index].detail)
+        clearActiveBatchItem(id)
+        status.stringValue = cancelled ? "Canceled \(batchItems[index].sourceURL.lastPathComponent)."
+            : "Could not transcribe \(batchItems[index].sourceURL.lastPathComponent): \(message)"
+        updateBatchPanel()
+        finishBatchIfDone()
+    }
+
+    private func finishBatchIfDone() {
+        guard batchHasStarted, activeBatchItemID == nil, batchItems.allSatisfy({ $0.state.isTerminal }) else { return }
+        let summary = BatchTranscriptionPlan.summary(for: batchItems)
+        status.stringValue = "Batch complete. \(summary)"
+        if busyKind == .batchTranscription { finishBusy() }
+        updateBatchPanel()
+    }
+
+    private func cancelCurrentBatchItem() {
+        guard let id = activeBatchItemID, let work = batchWorks[id] else { return }
+        status.stringValue = "Canceling current batch transcription…"
+        work.cancel()
+        InferenceJobQueue.shared.cancel(id)
+    }
+
+    private func cancelRemainingBatchItems() {
+        let queuedIDs = batchItems.filter { $0.state == .queued || $0.state == .paused }.map(\.id)
+        guard !queuedIDs.isEmpty else { return }
+        for id in queuedIDs {
+            batchWorks[id]?.cancel()
+            InferenceJobQueue.shared.cancel(id)
+            if let index = batchItems.firstIndex(where: { $0.id == id }) {
+                batchItems[index].state = .cancelled
+                batchItems[index].detail = "Canceled before starting"
+            }
+        }
+        status.stringValue = "Canceled the remaining queued files."
+        updateBatchPanel()
+        finishBatchIfDone()
+    }
+
+    private func retryFailedBatchItems() {
+        guard let settings = batchSettings, batchHasStarted, !isTerminating else { return }
+        let failedIDs = batchItems.filter { $0.state == .failed }.map(\.id)
+        guard !failedIDs.isEmpty else { return }
+        isBusy = true
+        busyKind = .batchTranscription
+        setBusyControls(true)
+        spinner.startAnimation(nil)
+        for id in failedIDs { enqueueBatchItem(id, settings: settings) }
+        status.stringValue = "Retrying failed batch files…"
+        updateBatchPanel()
+        finishBatchIfDone()
+    }
+
+    private func openBatchOutput(for id: UUID) {
+        guard let item = batchItems.first(where: { $0.id == id }) else { return }
+        NSWorkspace.shared.open(item.outputBaseURL.deletingLastPathComponent())
+    }
+
+    private func showBatchResult(for id: UUID) {
+        guard let result = batchResults[id] else { return }
+        clearMeetingNotes()
+        transcriptSegments = result.segments
+        speakerNames = Dictionary(uniqueKeysWithValues: result.speakerIDs.enumerated().map { ($1, "Speaker \($0 + 1)") })
+        outputBase = result.base
+        resultFolder = result.folder
+        transcript.string = Self.renderTranscript(result.segments, names: speakerNames)
+        transcript.textColor = .labelColor
+        updateSpeakerEditors()
+        updateTranscriptActionButtons()
+        showResultsButton.isHidden = false
+        status.stringValue = "Showing transcript for \(batchItems.first(where: { $0.id == id })?.sourceURL.lastPathComponent ?? "file")."
+    }
+
+    private func resetBatch() {
+        guard batchItems.allSatisfy({ $0.state.isTerminal }), activeBatchItemID == nil else { return }
+        batchItems.removeAll()
+        batchWorks.removeAll()
+        batchResults.removeAll()
+        batchSettings = nil
+        batchHasStarted = false
+        updateBatchPanel()
+    }
+
     @objc private func transcriptionButtonClicked() {
         if busyKind == .transcription, let work = activePreemptibleWork, let taskID = activeTranscriptionID {
             transcribeButton.title = "Canceling…"
@@ -1655,12 +1994,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
         outputBase = nil
         updateSpeakerEditors()
         updateTranscriptActionButtons()
-        let model = WhisperModel.choices[min(max(modelPicker.indexOfSelectedItem, 0), WhisperModel.choices.count - 1)]
-        let langIndex = languagePicker.indexOfSelectedItem
-        let detectSpeakers = speakerToggle.state == .on
-        let codes = ["auto", "en", "es", "fr", "de", "zh", "ja", "ko"]
-        let customCode = customLanguage.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let lang = model.id.hasSuffix(".en") ? "en" : (langIndex == 8 ? (customCode.isEmpty ? "auto" : customCode) : codes[max(0, min(langIndex, 7))])
+        let settings = selectedTranscriptionSettings()
+        let model = settings.model
+        let lang = settings.language
+        let detectSpeakers = settings.detectSpeakers
         ActivityCenter.shared.add(kind: .transcription, title: file.lastPathComponent, state: .queued,
             detail: "Waiting for Whisper", sourceURL: file, modelID: model.id, language: lang,
             detectSpeakers: detectSpeakers, id: taskID)
@@ -1734,7 +2071,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
                     finishJob(.paused)
                 } else {
                     let canceled = work.isCanceledByUser || operation.isCancelled || (error as? AppError == .cancelled)
-                    ActivityCenter.shared.update(taskID, state: canceled ? .failed : .failed,
+                    ActivityCenter.shared.update(taskID, state: canceled ? .cancelled : .failed,
                                                  detail: canceled ? "Canceled" : error.localizedDescription)
                     DispatchQueue.main.async {
                         guard self.activePreemptibleWork === work else { return }
@@ -1745,7 +2082,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
                         }
                         self.finishBusy()
                     }
-                    finishJob(.failed(canceled ? "Canceled" : error.localizedDescription))
+                    finishJob(canceled ? .cancelled : .failed(error.localizedDescription))
                 }
             }
         }
@@ -1754,6 +2091,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
     private func setBusyControls(_ busy: Bool) {
         let blocked = busy || meetingInProgress || isTerminating
         chooseButton.isEnabled = !blocked
+        let batchOwnsBusyState = busyKind == .batchTranscription
+        batchButton.isEnabled = !meetingInProgress && !isTerminating && (!busy || batchOwnsBusyState)
         modelPicker.isEnabled = !blocked
         let model = WhisperModel.choices[min(max(0, modelPicker.indexOfSelectedItem), WhisperModel.choices.count - 1)]
         languagePicker.isEnabled = !blocked && !model.id.hasSuffix(".en")

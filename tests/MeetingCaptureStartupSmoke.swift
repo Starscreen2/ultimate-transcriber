@@ -17,14 +17,15 @@ struct MeetingCaptureStartupSmoke {
         var didGate = false
         var becameActive = false
         var failure: String?
-        controller.onStateChange = { active in
+        controller.onStateChange = { _, active in
             lock.lock(); becameActive = becameActive || active; lock.unlock()
         }
-        controller.onFailure = { message, _ in
+        controller.onFailure = { _, message, _ in
             lock.lock(); failure = message; lock.unlock()
             completion.signal()
         }
-        controller.start(meetingsRoot: root, includeMicrophone: false, includeSystemAudio: true,
+        controller.start(sessionID: UUID(), priorityLeaseID: InferenceJobQueue.shared.acquirePriorityLease(),
+                         meetingsRoot: root, includeMicrophone: false, includeSystemAudio: true,
                          shouldBeginCapture: {
                              lock.withLock { didGate = true }
                              return false

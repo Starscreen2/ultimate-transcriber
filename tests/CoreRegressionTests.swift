@@ -20,6 +20,9 @@ struct CoreRegressionTests {
         try files.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? files.removeItem(at: root) }
 
+        try testBatchPlan(root: root)
+        try testInferenceQueue()
+
         expect(AppDelegate.parseTimestamp(" 01:02:03,456 ") == 3723.456, "valid timestamp")
         for timestamp in ["00::00:01", "bad:00:00:01", "00:00:nan", "00:60:00", "00:00:60", "-1:00:00", "00:1e1:00"] {
             expect(AppDelegate.parseTimestamp(timestamp) == nil, "invalid timestamp accepted: \(timestamp)")
@@ -103,7 +106,118 @@ struct CoreRegressionTests {
 
         try testTranscriptRecovery(root: root)
         try testAudioOffsets(root: root)
+        try testSilentAudioProtection(root: root)
         print("Passed \(checks) core regression checks")
+    }
+
+    static func testBatchPlan(root: URL) throws {
+        let folder = root.appendingPathComponent("batch-plan", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let wav = folder.appendingPathComponent("same.wav")
+        let mp3 = folder.appendingPathComponent("same.mp3")
+        let other = folder.appendingPathComponent("same (wav).mov")
+        for file in [wav, mp3, other] { try Data([1]).write(to: file) }
+        let items = BatchTranscriptionPlan.makeItems(for: [wav, mp3, other, wav])
+        expect(items.count == 3, "batch plan did not remove duplicate source files")
+        let outputs = Set(items.map { $0.outputBaseURL.standardizedFileURL.path.lowercased() })
+        expect(outputs.count == items.count, "batch inputs with colliding names share export paths")
+        let plain = folder.appendingPathComponent("separate.wav")
+        try Data([2]).write(to: plain)
+        let plainItem = BatchTranscriptionPlan.makeItems(for: [plain]).first
+        expect(plainItem?.outputBaseURL.lastPathComponent == "separate", "batch plan changed an ordinary output name")
+        expect(BatchTranscriptionPlan.summary(for: items) == "3 files ready.", "batch ready summary")
+        var mixed = items
+        mixed[0].state = .completed
+        mixed[1].state = .failed
+        expect(BatchTranscriptionPlan.summary(for: mixed).contains("1 finished") &&
+               BatchTranscriptionPlan.summary(for: mixed).contains("1 failed"), "batch summary did not report terminal outcomes")
+    }
+
+    static func testInferenceQueue() throws {
+        let queue = InferenceJobQueue.shared
+        let center = ActivityCenter.shared
+        let firstID = UUID(), canceledID = UUID(), thirdID = UUID()
+        let ids = [firstID, canceledID, thirdID]
+        defer { ids.forEach { center.remove($0) } }
+        ids.forEach { center.add(kind: .transcription, title: "queue regression", state: .queued, detail: "Test", id: $0) }
+        let firstStarted = DispatchSemaphore(value: 0)
+        let releaseFirst = DispatchSemaphore(value: 0)
+        let twoFinished = DispatchSemaphore(value: 0)
+        let lock = NSLock()
+        var events: [String] = []
+        var active = 0
+        var maximumActive = 0
+        func record(_ event: String, delta: Int) {
+            lock.lock()
+            events.append(event)
+            active += delta
+            maximumActive = max(maximumActive, active)
+            lock.unlock()
+        }
+
+        queue.enqueue(id: firstID, title: "first") { finish in
+            record("start-first", delta: 1)
+            firstStarted.signal()
+            _ = releaseFirst.wait(timeout: .now() + 5)
+            record("end-first", delta: -1)
+            finish(.completed)
+            twoFinished.signal()
+        }
+        expect(firstStarted.wait(timeout: .now() + 5) == .success, "first queue job did not start")
+        queue.enqueue(id: canceledID, title: "canceled") { _ in record("unexpected-canceled", delta: 0) }
+        queue.enqueue(id: thirdID, title: "third") { finish in
+            record("start-third", delta: 1)
+            record("end-third", delta: -1)
+            finish(.completed)
+            twoFinished.signal()
+        }
+        queue.cancel(canceledID)
+        releaseFirst.signal()
+        expect(twoFinished.wait(timeout: .now() + 5) == .success, "first queue job did not finish")
+        expect(twoFinished.wait(timeout: .now() + 5) == .success, "third queue job did not finish")
+        for _ in 0..<500 where queue.isBusy { Thread.sleep(forTimeInterval: 0.01) }
+        lock.lock(); let recordedEvents = events; let observedMaximum = maximumActive; lock.unlock()
+        expect(recordedEvents == ["start-first", "end-first", "start-third", "end-third"], "queue cancellation or FIFO order failed: \(recordedEvents)")
+        expect(observedMaximum == 1, "inference jobs ran concurrently")
+        expect(center.snapshot.first(where: { $0.id == canceledID })?.state == .cancelled, "queued cancellation state was not preserved")
+
+        let retryID = UUID()
+        defer { center.remove(retryID) }
+        center.add(kind: .transcription, title: "preemption regression", state: .queued, detail: "Test", id: retryID)
+        let retryStarted = DispatchSemaphore(value: 0)
+        let firstPaused = DispatchSemaphore(value: 0)
+        let retried = DispatchSemaphore(value: 0)
+        let preemptionLock = NSLock()
+        var wasPreempted = false
+        var attempts = 0
+        queue.enqueue(id: retryID, title: "preemption", preempt: {
+            preemptionLock.lock(); wasPreempted = true; preemptionLock.unlock()
+        }) { finish in
+            preemptionLock.lock(); attempts += 1; let attempt = attempts; preemptionLock.unlock()
+            if attempt == 1 {
+                retryStarted.signal()
+                while true {
+                    preemptionLock.lock(); let stop = wasPreempted; preemptionLock.unlock()
+                    if stop { break }
+                    Thread.sleep(forTimeInterval: 0.002)
+                }
+                finish(.paused)
+                firstPaused.signal()
+            } else {
+                finish(.completed)
+                retried.signal()
+            }
+        }
+        expect(retryStarted.wait(timeout: .now() + 5) == .success, "preemptible queue job did not start")
+        let lease = queue.acquirePriorityLease()
+        expect(firstPaused.wait(timeout: .now() + 5) == .success, "queue job did not pause for a priority lease")
+        expect(center.snapshot.first(where: { $0.id == retryID })?.state == .paused, "paused queue item state was not preserved")
+        queue.releasePriorityLease(lease)
+        expect(retried.wait(timeout: .now() + 5) == .success, "paused queue job did not resume")
+        for _ in 0..<500 where queue.isBusy { Thread.sleep(forTimeInterval: 0.01) }
+        preemptionLock.lock(); let observedAttempts = attempts; preemptionLock.unlock()
+        expect(observedAttempts == 2 && center.snapshot.first(where: { $0.id == retryID })?.state == .completed,
+               "paused queue job did not complete on retry")
     }
 
     static func testTranscriptRecovery(root: URL) throws {
@@ -138,17 +252,54 @@ struct CoreRegressionTests {
             try audioFile.write(from: buffer)
         }
         let mix = try MeetingCaptureController.mixRecordings(in: root, recordings: [(source, 0.5)])
-        let decoded = root.appendingPathComponent("mixed.wav")
-        _ = try AppDelegate.run("/opt/homebrew/bin/ffmpeg", ["-v", "error", "-y", "-i", mix.path, "-ar", "16000", "-ac", "1", "-c:a", "pcm_f32le", decoded.path])
-        let file = try AVAudioFile(forReading: decoded)
-        let samples = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: AVAudioFrameCount(file.length))!
-        try file.read(into: samples)
-        expect(samples.frameLength > 23_000, "audio offset missing from mixed duration")
+        let decoded = root.appendingPathComponent("mixed.s16le")
+        _ = try AppDelegate.run("/opt/homebrew/bin/ffmpeg", ["-v", "error", "-y", "-i", mix.path, "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", "-f", "s16le", decoded.path])
+        let samples = try Data(contentsOf: decoded)
+        let frameCount = samples.count / MemoryLayout<Int16>.size
+        expect(frameCount > 23_000, "audio offset missing from mixed duration")
+        func sample(at index: Int) -> Double {
+            let offset = index * 2
+            let bits = UInt16(samples[offset]) | (UInt16(samples[offset + 1]) << 8)
+            return Double(Int16(bitPattern: bits)) / Double(Int16.max)
+        }
         func rms(from: Int, through: Int) -> Double {
-            let channel = samples.floatChannelData![0]
-            return sqrt((from..<through).reduce(0.0) { $0 + pow(Double(channel[$1]), 2) } / Double(through - from))
+            return sqrt((from..<through).reduce(0.0) { $0 + pow(sample(at: $1), 2) } / Double(through - from))
         }
         expect(rms(from: 1000, through: 5000) < 0.003, "leading silence lost")
         expect(rms(from: 10_000, through: 14_000) > 0.15, "delayed audio missing")
+    }
+
+    static func testSilentAudioProtection(root: URL) throws {
+        let folder = root.appendingPathComponent("silent-audio-protection")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let source = folder.appendingPathComponent("microphone.wav")
+        let format = AVAudioFormat(standardFormatWithSampleRate: 16_000, channels: 1)!
+        try writeSilentWave(at: source, format: format)
+
+        var rejectedAsSilent = false
+        do {
+            _ = try MeetingCaptureController.saveTranscriptAndMixRecordings(
+                in: folder,
+                segments: [TranscriptSegment(start: 0, end: 2, text: "Thank you.", speakerID: nil)],
+                recordings: [(source, 0)])
+        } catch {
+            rejectedAsSilent = error.localizedDescription.localizedCaseInsensitiveContains("no usable audio signal")
+        }
+        expect(rejectedAsSilent, "silent meeting audio was accepted for transcription")
+        expect(FileManager.default.fileExists(atPath: source.path), "silent validation deleted the original audio track")
+        expect(!FileManager.default.fileExists(atPath: folder.appendingPathComponent("audio.m4a").path),
+               "silent meeting audio was committed as a valid mix")
+        for ext in ["txt", "srt", "vtt"] {
+            expect(!FileManager.default.fileExists(atPath: folder.appendingPathComponent("transcript." + ext).path),
+                   "silent audio produced a misleading \(ext.uppercased()) transcript")
+        }
+    }
+
+    private static func writeSilentWave(at url: URL, format: AVAudioFormat) throws {
+        let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 32_000)!
+        buffer.frameLength = 32_000
+        for index in 0..<Int(buffer.frameLength) { buffer.floatChannelData![0][index] = 0 }
+        let file = try AVAudioFile(forWriting: url, settings: format.settings)
+        try file.write(from: buffer)
     }
 }

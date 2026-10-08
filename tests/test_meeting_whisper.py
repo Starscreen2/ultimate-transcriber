@@ -40,8 +40,14 @@ class MeetingWhisperTests(unittest.TestCase):
         records = [json.loads(line) for line in result.stdout.splitlines()]
         return result, records
 
+    @staticmethod
+    def voiced_audio(seconds):
+        # A constant low-amplitude signal is sufficient for the deterministic
+        # fixture and passes the production silence gate.
+        return struct.pack("<f", 0.01) * (int(seconds * 16000))
+
     def test_crossing_segment_retains_fresh_words_and_subword_tokens(self):
-        result, records = self.invoke(b"\0" * (6 * 16000 * 4))
+        result, records = self.invoke(self.voiced_audio(6))
         self.assertEqual(result.returncode, 0, result.stderr)
         segments = [record for record in records if record["type"] == "segment"]
         self.assertEqual([segment["text"] for segment in segments], [" old words.", " freshly arrived."])
@@ -49,17 +55,17 @@ class MeetingWhisperTests(unittest.TestCase):
         self.assertEqual(records[-1]["type"], "finished")
 
     def test_missing_token_times_preserve_crossing_speech(self):
-        result, records = self.invoke(b"\0" * (6 * 16000 * 4), model="unknown-times")
+        result, records = self.invoke(self.voiced_audio(6), model="unknown-times")
         self.assertEqual(result.returncode, 0)
         self.assertEqual(records[-2]["text"], " old words. freshly arrived.")
 
     def test_segment_wholly_inside_overlap_is_not_repeated(self):
-        result, records = self.invoke(b"\0" * (6 * 16000 * 4), model="overlap-only")
+        result, records = self.invoke(self.voiced_audio(6), model="overlap-only")
         self.assertEqual(result.returncode, 0)
         self.assertEqual(sum(record["type"] == "segment" for record in records), 1)
 
     def test_short_final_chunk_has_bounded_timestamps(self):
-        result, records = self.invoke(b"\0" * (int(4.25 * 16000) * 4))
+        result, records = self.invoke(self.voiced_audio(4.25))
         self.assertEqual(result.returncode, 0)
         segments = [record for record in records if record["type"] == "segment"]
         self.assertEqual(segments[-1]["end"], 4.25)
@@ -99,7 +105,7 @@ class MeetingWhisperTests(unittest.TestCase):
         result, records = self.invoke(model="fail-load")
         self.assertEqual(result.returncode, 3)
         self.assertEqual(records, [])
-        result, records = self.invoke(b"\0" * (64000 * 4), model="fail-inference")
+        result, records = self.invoke(self.voiced_audio(4), model="fail-inference")
         self.assertEqual(result.returncode, 5)
         self.assertEqual(records, [{"type": "ready"}])
 

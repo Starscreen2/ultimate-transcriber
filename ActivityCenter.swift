@@ -22,6 +22,7 @@ enum ActivityState: String, Codable {
     case paused
     case completed
     case failed
+    case cancelled
     case interrupted
 }
 
@@ -161,7 +162,7 @@ final class ActivityCenter {
 
     func removeFinished() {
         lock.lock()
-        items.removeAll { $0.state == .completed }
+        items.removeAll { $0.state == .completed || $0.state == .cancelled }
         persistLocked()
         lock.unlock()
         notifyChange()

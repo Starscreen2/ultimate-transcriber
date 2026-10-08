@@ -29,12 +29,17 @@ extension MeetingCaptureController {
     }
     func injectSources(folder: URL, engine: URL, twoSources: Bool) throws {
         resetSessionTimeline()
+        let sessionID = UUID()
+        self.sessionID = sessionID
         sessionFolder = folder
         for source in twoSources ? [MeetingAudioSource.microphone, .system] : [.microphone] {
-            let worker = LiveWhisperWorker { [weak self] segment in self?.receive(segment, source: source) }
+            let worker = LiveWhisperWorker { [weak self] segment in
+                self?.receive(segment, source: source, sessionID: sessionID)
+            }
             try worker.start(executable: engine, model: folder.appendingPathComponent("unused.bin"))
             let url = source == .microphone ? folder.appendingPathComponent("missing/input.caf") : folder.appendingPathComponent("system.caf")
-            installSourceState(MeetingAudioSourceState(source: source, recordingURL: url, worker: worker))
+            installSourceState(MeetingAudioSourceState(sessionID: sessionID, source: source,
+                                                       recordingURL: url, worker: worker))
         }
         updateState(active: true, starting: false, stopping: false)
     }
@@ -81,11 +86,11 @@ extension MeetingCaptureController {
             var result: MeetingSessionResult?
             var failure: String?
             var warnings: [String] = []
-            controller.onStatus = { message in
+            controller.onStatus = { _, message in
                 if message.contains("recording stopped") { lock.withLock { warnings.append(message) } }
             }
             controller.onFinished = { value in lock.withLock { result = value; done = true } }
-            controller.onFailure = { message, _ in lock.withLock { failure = message; done = true } }
+            controller.onFailure = { _, message, _ in lock.withLock { failure = message; done = true } }
             try controller.injectSources(folder: folder, engine: engine, twoSources: twoSources)
             controller.injectBuffer(source: .microphone)
             let firstWarningCount = lock.withLock { warnings.count }
@@ -139,7 +144,8 @@ with tempfile.TemporaryDirectory(prefix="meeting-capture-tests-") as directory:
         "swiftc", "-DREGRESSION_TESTS", "-parse-as-library", "-swift-version", "5",
         "-target", "arm64-apple-macos13.0", "-framework", "AppKit", "-framework", "AVFoundation",
         "-framework", "CoreAudio", "-framework", "ApplicationServices", "-framework", "UniformTypeIdentifiers",
-        str(ROOT / "TranscribeToText.swift"), str(ROOT / "LocalMeetingSummarizer.swift"),
+        str(ROOT / "TranscribeToText.swift"), str(ROOT / "BatchTranscription.swift"),
+        str(ROOT / "ActivityCenter.swift"), str(ROOT / "LocalMeetingSummarizer.swift"),
         str(ROOT / "MeetingDetection.swift"), str(source), "-o", str(binary)
     ], check=True)
     subprocess.run([str(binary)], check=True, timeout=30)

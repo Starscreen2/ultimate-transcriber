@@ -100,7 +100,7 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 swiftc -parse-as-library -swift-version 5 -target arm64-apple-macos13.0 \
   -framework SwiftUI -framework AVFoundation -framework UniformTypeIdentifiers -framework AppKit \
   -framework CoreAudio -framework ApplicationServices \
-  "$ROOT/TranscribeToText.swift" "$ROOT/ActivityCenter.swift" "$ROOT/MeetingCapture.swift" "$ROOT/LocalMeetingSummarizer.swift" "$ROOT/MeetingDetection.swift" \
+  "$ROOT/TranscribeToText.swift" "$ROOT/BatchTranscription.swift" "$ROOT/ActivityCenter.swift" "$ROOT/MeetingCapture.swift" "$ROOT/LocalMeetingSummarizer.swift" "$ROOT/MeetingDetection.swift" \
   -o "$APP/Contents/MacOS/TranscribeToText"
 cp "$ROOT/build/meeting-whisper/bin/whisper-cli" "$APP/Contents/Resources/whisper-cli"
 cp "$ROOT/build/meeting-whisper/bin/meeting-whisper" "$APP/Contents/Resources/meeting-whisper"
@@ -154,7 +154,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundleDisplayName</key><string>Transcribe to Text</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
-  <key>CFBundleShortVersionString</key><string>0.3.3</string>
+  <key>CFBundleShortVersionString</key><string>0.3.4</string>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
   <key>NSMicrophoneUsageDescription</key><string>Transcribe to Text uses microphone audio to record and transcribe meetings on this Mac.</string>
   <key>NSAudioCaptureUsageDescription</key><string>Transcribe to Text captures audio playing through this Mac so it can transcribe and save meeting notes locally.</string>

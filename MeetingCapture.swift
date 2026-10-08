@@ -5,7 +5,7 @@ import Darwin
 
 final class InferenceJobQueue {
     static let shared = InferenceJobQueue()
-    enum Completion { case completed, paused, failed(String) }
+    enum Completion { case completed, paused, cancelled, failed(String) }
     typealias Job = (@escaping (Completion) -> Void) -> Void
     private struct QueuedJob {
         let id: UUID
@@ -82,7 +82,7 @@ final class InferenceJobQueue {
         if let index = jobs.firstIndex(where: { $0.id == id }) {
             jobs.remove(at: index)
             lock.unlock()
-            ActivityCenter.shared.update(id, state: .failed, detail: "Canceled")
+            ActivityCenter.shared.update(id, state: .cancelled, detail: "Canceled")
             return
         }
         let active = activeJob?.id == id ? activeJob : nil
@@ -125,6 +125,7 @@ final class InferenceJobQueue {
         switch completion {
         case .completed: ActivityCenter.shared.update(task.id, state: .completed, detail: "Finished")
         case .paused: ActivityCenter.shared.update(task.id, state: .paused, detail: "Paused for the active recording")
+        case .cancelled: ActivityCenter.shared.update(task.id, state: .cancelled, detail: "Canceled")
         case .failed(let message): ActivityCenter.shared.update(task.id, state: .failed, detail: message)
         }
         if let notify { DispatchQueue.main.async(execute: notify) }
@@ -140,6 +141,17 @@ struct MeetingSessionResult {
     let segments: [TranscriptSegment]
     let speakerIDs: [Int]
     let speakerWarning: String?
+}
+
+enum MeetingAudioValidationError: LocalizedError {
+    case noUsableSignal
+
+    var errorDescription: String? {
+        switch self {
+        case .noUsableSignal:
+            return "No usable audio signal was captured. The transcript was not saved, and the original audio tracks were kept in the meeting folder. Check the selected microphone and system-audio access before recording again."
+        }
+    }
 }
 
 private enum MeetingAudioSource: String, Hashable {
@@ -1045,24 +1057,8 @@ final class MeetingCaptureController: NSObject {
             }
         }
 
-        // Save the transcript accumulated during recording immediately after
-        // capture has stopped. The workers may still decode their final audio
-        // chunks; the completed transcript below will replace this snapshot.
         let folder = sessionFolder
         let finishedSessionID = sessionID
-        let snapshot: [TranscriptSegment] = stateLock.withLock { sessionSegments }
-        if let folder {
-            do {
-                try AppDelegate.writeExports(base: folder.appendingPathComponent("transcript"),
-                                             segments: snapshot, names: [:])
-            } catch {
-                stateLock.withLock {
-                    observedCaptureError = [observedCaptureError,
-                        "The transcript could not be saved immediately: \(error.localizedDescription)"]
-                        .compactMap { $0 }.joined(separator: " ")
-                }
-            }
-        }
 
         let sessionWarning: String? = stateLock.withLock {
             let warning = observedCaptureError
@@ -1219,13 +1215,21 @@ final class MeetingCaptureController: NSObject {
         }
     }
 
-    // Persist the completed transcript before optional audio/speaker processing.
-    // A missing converter, corrupt source, or short recording must not lose text.
+    // Preserve transcript text if an unrelated mix error occurs, but never
+    // save live-model guesses when the captured audio is effectively silent.
     static func saveTranscriptAndMixRecordings(in folder: URL, segments: [TranscriptSegment],
                                                recordings: [(url: URL, offset: Double)]) throws -> (audio: URL, transcriptBase: URL) {
         let base = folder.appendingPathComponent("transcript")
+        let audio: URL
+        do {
+            audio = try mixRecordings(in: folder, recordings: recordings)
+        } catch {
+            if !(error is MeetingAudioValidationError) {
+                try? AppDelegate.writeExports(base: base, segments: segments, names: [:])
+            }
+            throw error
+        }
         try AppDelegate.writeExports(base: base, segments: segments, names: [:])
-        let audio = try mixRecordings(in: folder, recordings: recordings)
         return (audio, base)
     }
 
@@ -1265,46 +1269,17 @@ final class MeetingCaptureController: NSObject {
     }
 
     private static func validateAudioHasSignal(_ url: URL) throws {
-        let file = try AVAudioFile(forReading: url)
-        let format = file.processingFormat
-        guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 16_384) else {
-            throw AppError.message("The saved meeting audio could not be checked for sound.")
+        guard let ffmpeg = ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/usr/bin/ffmpeg"]
+            .first(where: { FileManager.default.isExecutableFile(atPath: $0) }) else {
+            throw AppError.message("FFmpeg is needed to validate the saved meeting audio.")
         }
-        var peak: Float = 0
-        while file.framePosition < file.length {
-            let remaining = file.length - file.framePosition
-            try file.read(into: buffer, frameCount: AVAudioFrameCount(min(remaining, Int64(buffer.frameCapacity))))
-            let frames = Int(buffer.frameLength)
-            guard frames > 0 else { break }
-            let channels = Int(format.channelCount)
-            switch format.commonFormat {
-            case .pcmFormatFloat32:
-                guard let samples = buffer.floatChannelData else {
-                    throw AppError.message("The saved meeting audio could not be checked for sound.")
-                }
-                for channel in 0..<channels {
-                    for frame in 0..<frames { peak = max(peak, abs(samples[channel][frame])) }
-                }
-            case .pcmFormatInt16:
-                guard let samples = buffer.int16ChannelData else {
-                    throw AppError.message("The saved meeting audio could not be checked for sound.")
-                }
-                for channel in 0..<channels {
-                    for frame in 0..<frames { peak = max(peak, abs(Float(samples[channel][frame]) / Float(Int16.max))) }
-                }
-            case .pcmFormatInt32:
-                guard let samples = buffer.int32ChannelData else {
-                    throw AppError.message("The saved meeting audio could not be checked for sound.")
-                }
-                for channel in 0..<channels {
-                    for frame in 0..<frames { peak = max(peak, abs(Float(samples[channel][frame]) / Float(Int32.max))) }
-                }
-            default:
-                throw AppError.message("The saved meeting audio has an unsupported format and could not be checked for sound.")
-            }
-        }
-        guard peak > 0.00001 else {
-            throw AppError.message("The captured audio contains only silence. The original recording tracks were kept in this meeting folder; check microphone and system-audio access before recording again.")
+        let report = try AppDelegate.run(ffmpeg,
+            ["-hide_banner", "-nostats", "-i", url.path, "-vn", "-af", "volumedetect", "-f", "null", "-"])
+        let peakLine = report.split(whereSeparator: \.isNewline).first { $0.contains("max_volume:") }
+        let peakToken = peakLine?.components(separatedBy: "max_volume:").last?
+            .trimmingCharacters(in: .whitespacesAndNewlines).split(whereSeparator: \.isWhitespace).first
+        guard let peakToken, let peakDB = Double(peakToken), peakDB.isFinite, peakDB > -80 else {
+            throw MeetingAudioValidationError.noUsableSignal
         }
     }
 
