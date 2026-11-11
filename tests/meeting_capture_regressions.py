@@ -144,7 +144,10 @@ with tempfile.TemporaryDirectory(prefix="meeting-capture-tests-") as directory:
         "swiftc", "-DREGRESSION_TESTS", "-parse-as-library", "-swift-version", "5",
         "-target", "arm64-apple-macos13.0", "-framework", "AppKit", "-framework", "AVFoundation",
         "-framework", "CoreAudio", "-framework", "ApplicationServices", "-framework", "UniformTypeIdentifiers",
-        str(ROOT / "TranscribeToText.swift"), str(ROOT / "BatchTranscription.swift"),
+        "-framework", "SwiftUI",
+        str(ROOT / "TranscribeToText.swift"), str(ROOT / "WorkspaceInterface.swift"),
+        str(ROOT / "WorkspaceLibrary.swift"), str(ROOT / "WhisperArchive.swift"),
+        str(ROOT / "BatchTranscription.swift"),
         str(ROOT / "ActivityCenter.swift"), str(ROOT / "LocalMeetingSummarizer.swift"),
         str(ROOT / "MeetingDetection.swift"), str(source), "-o", str(binary)
     ], check=True)

@@ -14,11 +14,27 @@ Open `build/Transcribe to Text.app`. Local builds are certificate-signed using a
 
 Run `./tests/run-regressions.sh` for local regression checks.
 
+## Download
+
+Download the prebuilt **Apple Silicon** app from [GitHub Releases](https://github.com/Starscreen2/ultimate-transcriber/releases/latest). Unzip it and move `Transcribe to Text.app` to Applications. It requires macOS 13 or later; system audio capture requires macOS 14.2 or later. Models are downloaded separately when first used. This release is not notarized and may trigger a macOS security warning.
+
 ## Transcribe files
 
 Choose a media file, model, and language, then select **Transcribe**. Text appears as it is recognized. **Copy Transcript** copies the preview; **Export…** saves TXT, SRT, or WebVTT. Speaker labels can be renamed and are reflected in the exports. Models are downloaded on first use and stored in `~/Library/Application Support/TranscribeToText/`.
 
 Select **Batch…** to add multiple files, remove selections, and start a sequential queue. The model, language, and speaker setting selected in the main window apply to the batch. Each file gets TXT, SRT, and WebVTT exports beside its source; the batch window shows progress, lets you cancel the current or remaining files, retry failures, open output folders, and load completed transcripts into the preview.
+
+## Workspace and transcript library
+
+The main window now uses a persistent workspace with Home, Queue, Transcriptions, Meetings, Recently Deleted, Folders, People, and Settings navigation. It keeps the existing local transcription engine, meeting capture, speaker recognition, model downloads, batch window, and activity queue behind the new interface.
+
+Completed transcripts are saved to `~/Library/Application Support/TranscribeToText/library/transcriptions.json`. This library stores transcript text, segment times, speaker labels, the source and export paths, the chosen model/language, and basic counts/dates. Editing a segment or speaker and marking a favorite is saved to the library and refreshes the adjacent TXT/SRT/VTT exports. Moving an item to Recently Deleted only marks the library entry; the original media and exports stay in place. Permanent deletion removes the library record only. If the saved JSON cannot be read, the workspace surfaces a warning and blocks writes so a new save cannot overwrite the unreadable file.
+
+The transcript workspace includes synchronized audio playback, transcript/Summary/Chat views, speaker reassignment, text search and replace, favorites, and a local Info inspector. Summary and transcript chat use the existing local Qwen notes model; first use may download about 2.5 GB. Chat is grounded in the open transcript. These local features do not call a cloud service.
+
+**Export .whisper** writes a version 2 archive containing `version`, `metadata.json`, and the original audio, and the file chooser can import version 1 or 2 archives. Imported audio is extracted beneath `~/Library/Application Support/TranscribeToText/imported-archives/`. This implementation currently archives audio only; video archives, word-level timing, translations, tags, and richer editor metadata are not preserved. TXT, SRT, WebVTT, and the current archive path have regression coverage; archives from every MacWhisper release have not been validated.
+
+Direct URL intake, cloud transcription, live caption overlays, per-app audio capture, voice memos, podcast track editing, watched-folder automation, translation, and external integrations are not implemented in this build. The workspace labels unavailable actions rather than suggesting that they work.
 
 ## Capture meetings
 

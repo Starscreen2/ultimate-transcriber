@@ -26,7 +26,7 @@ enum ActivityState: String, Codable {
     case interrupted
 }
 
-struct ActivityItem: Codable, Identifiable {
+struct ActivityItem: Codable, Identifiable, Equatable {
     var id: UUID
     var kind: ActivityKind
     var title: String
@@ -172,8 +172,8 @@ final class ActivityCenter {
         snapshot.filter { item in
             guard item.state == .queued || item.state == .paused else { return false }
             if let source = item.sourceURL { return FileManager.default.fileExists(atPath: source.path) }
-            if item.kind == .summary, let folder = item.folderURL {
-                return FileManager.default.fileExists(atPath: folder.appendingPathComponent("transcript.srt").path)
+            if item.kind == .summary, let transcript = summaryTranscriptURL(for: item) {
+                return FileManager.default.fileExists(atPath: transcript.path)
             }
             return false
         }
@@ -186,8 +186,8 @@ final class ActivityCenter {
             case .transcription:
                 return item.sourceURL.map { !FileManager.default.fileExists(atPath: $0.path) } ?? true
             case .summary:
-                guard let folder = item.folderURL else { return true }
-                return !FileManager.default.fileExists(atPath: folder.appendingPathComponent("transcript.srt").path)
+                guard let transcript = summaryTranscriptURL(for: item) else { return true }
+                return !FileManager.default.fileExists(atPath: transcript.path)
             case .recording:
                 return false
             }
@@ -200,6 +200,13 @@ final class ActivityCenter {
 
     private func notifyChange() {
         DispatchQueue.main.async { [weak self] in self?.onChange?() }
+    }
+
+    private func summaryTranscriptURL(for item: ActivityItem) -> URL? {
+        if let outputBasePath = item.outputBasePath {
+            return URL(fileURLWithPath: outputBasePath + ".srt")
+        }
+        return item.folderURL?.appendingPathComponent("transcript.srt")
     }
 
     private func persist() {

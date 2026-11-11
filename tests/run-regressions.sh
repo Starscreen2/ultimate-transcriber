@@ -8,9 +8,9 @@ export PYTHONDONTWRITEBYTECODE=1
 TEMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/transcriber-tests.XXXXXX")"
 trap 'rm -rf "$TEMP_ROOT"' EXIT
 SWIFT_FLAGS=(-DREGRESSION_TESTS -parse-as-library -swift-version 5 -target arm64-apple-macos13.0
-  -framework AppKit -framework AVFoundation -framework CoreAudio -framework ApplicationServices -framework UniformTypeIdentifiers)
+  -framework AppKit -framework AVFoundation -framework CoreAudio -framework ApplicationServices -framework UniformTypeIdentifiers -framework SwiftUI)
 TEST_MACOS_SDK="$(xcrun --sdk macosx --show-sdk-path)"
-SWIFT_SOURCES=(TranscribeToText.swift BatchTranscription.swift ActivityCenter.swift MeetingCapture.swift LocalMeetingSummarizer.swift MeetingDetection.swift)
+SWIFT_SOURCES=(TranscribeToText.swift WorkspaceInterface.swift WorkspaceLibrary.swift WhisperArchive.swift BatchTranscription.swift ActivityCenter.swift MeetingCapture.swift LocalMeetingSummarizer.swift MeetingDetection.swift)
 swiftc "${SWIFT_FLAGS[@]}" "${SWIFT_SOURCES[@]}" tests/CoreRegressionTests.swift -o "$TEMP_ROOT/core-regressions"
 swiftc "${SWIFT_FLAGS[@]}" "${SWIFT_SOURCES[@]}" tests/MeetingDetectionTests.swift -o "$TEMP_ROOT/detection-regressions"
 "${CXX:-c++}" -std=c++17 -isystem"$TEST_MACOS_SDK/usr/include/c++/v1" \

@@ -21,6 +21,9 @@ struct CoreRegressionTests {
         defer { try? files.removeItem(at: root) }
 
         try testBatchPlan(root: root)
+        try testWhisperArchive(root: root)
+        try testWorkspaceLibrary(root: root)
+        try testWorkspaceEditInvalidation()
         try testInferenceQueue()
 
         expect(AppDelegate.parseTimestamp(" 01:02:03,456 ") == 3723.456, "valid timestamp")
@@ -131,6 +134,106 @@ struct CoreRegressionTests {
         mixed[1].state = .failed
         expect(BatchTranscriptionPlan.summary(for: mixed).contains("1 finished") &&
                BatchTranscriptionPlan.summary(for: mixed).contains("1 failed"), "batch summary did not report terminal outcomes")
+    }
+
+    static func testWhisperArchive(root: URL) throws {
+        let source = root.appendingPathComponent("archive-source.aiff")
+        let audio = Data("synthetic archive audio bytes".utf8)
+        try audio.write(to: source)
+        let firstID = UUID()
+        let segments = [
+            TranscriptSegment(id: firstID, start: 0.125, end: 1.75, text: "Hello archive.", speakerID: 0,
+                              isFavorite: true, isUneven: true),
+            TranscriptSegment(start: 1.75, end: 2.5, text: "Second segment.", speakerID: nil)
+        ]
+        let archive = root.appendingPathComponent("roundtrip.whisper")
+        try WhisperArchive.export(source: source, segments: segments, names: [0: "Speaker One"],
+                                  modelID: "small.en", language: "en", to: archive)
+
+        let verify = Process()
+        verify.executableURL = URL(fileURLWithPath: "/usr/bin/unzip")
+        verify.arguments = ["-t", archive.path]
+        verify.standardOutput = FileHandle.nullDevice
+        verify.standardError = FileHandle.nullDevice
+        try verify.run()
+        verify.waitUntilExit()
+        expect(verify.terminationStatus == 0, "generated Whisper archive failed ZIP CRC validation")
+
+        let imported = try WhisperArchive.import(archive: archive, destinationRoot: root.appendingPathComponent("archive-imports"))
+        expect(try Data(contentsOf: imported.mediaURL) == audio, "Whisper archive changed original audio bytes")
+        expect(imported.modelID == "small.en" && imported.language == "en", "Whisper archive lost model or language")
+        expect(imported.segments.count == 2 && imported.segments[0].id == firstID, "Whisper archive changed segment identity")
+        expect(imported.segments[0].start == 0.125 && imported.segments[0].end == 1.75, "Whisper archive changed millisecond timings")
+        expect(imported.segments[0].isFavorite && imported.segments[0].isUneven, "Whisper archive dropped favorite or uneven state")
+        expect(imported.speakerNames.values.contains("Speaker One") && imported.segments[0].speakerID != nil,
+               "Whisper archive dropped the speaker label")
+
+    }
+
+    static func testWorkspaceLibrary(root: URL) throws {
+        let storeURL = root.appendingPathComponent("library/transcriptions.json")
+        let library = WorkspaceLibrary(fileURL: storeURL)
+        let entry = WorkspaceLibraryEntry(
+            id: UUID(), title: "workspace-test.aiff", sourcePath: "/tmp/workspace-test.aiff",
+            outputBasePath: "/tmp/workspace-test", folderPath: "/tmp", modelID: "tiny", language: "en",
+            duration: 3.5, createdAt: Date(), updatedAt: Date(), kind: .transcription,
+            segments: [TranscriptSegment(start: 0, end: 1.25, text: "Saved speaker label", speakerID: 4,
+                                          isFavorite: true, startsNewParagraph: true)],
+            speakerNames: [4: "Casey"], isDeleted: false, summaryTranscriptDigest: "digest-v1")
+        try library.save(entry)
+        let reloaded = WorkspaceLibrary(fileURL: storeURL)
+        expect(reloaded.loadError == nil && reloaded.snapshot == [entry],
+               "workspace library did not persist and reload transcript fields")
+        try reloaded.delete(entry.id)
+        expect(reloaded.snapshot.first?.isDeleted == true, "workspace delete did not move entry to Recently Deleted")
+        try reloaded.restore(entry.id)
+        expect(reloaded.snapshot.first?.isDeleted == false, "workspace restore did not recover entry")
+        try reloaded.permanentlyDelete(entry.id)
+        expect(reloaded.snapshot.isEmpty, "workspace permanent deletion retained library entry")
+
+        let damagedURL = root.appendingPathComponent("damaged-library/transcriptions.json")
+        let damagedBytes = Data("{ this is not transcript JSON }".utf8)
+        try FileManager.default.createDirectory(at: damagedURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try damagedBytes.write(to: damagedURL)
+        let damagedLibrary = WorkspaceLibrary(fileURL: damagedURL)
+        expect(damagedLibrary.loadError != nil && damagedLibrary.snapshot.isEmpty,
+               "workspace library did not surface a malformed store")
+        expectFailure("workspace library overwrote a malformed store") { try damagedLibrary.save(entry) }
+        expect(try Data(contentsOf: damagedURL) == damagedBytes,
+               "failed workspace save changed the malformed library file")
+
+        let blocker = root.appendingPathComponent("not-a-directory")
+        try Data("blocker".utf8).write(to: blocker)
+        let failedWriteLibrary = WorkspaceLibrary(fileURL: blocker.appendingPathComponent("transcriptions.json"))
+        expectFailure("workspace library save unexpectedly succeeded without a writable parent") {
+            try failedWriteLibrary.save(entry)
+        }
+        expect(failedWriteLibrary.snapshot.isEmpty, "failed workspace save changed in-memory library contents")
+    }
+
+    static func testWorkspaceEditInvalidation() throws {
+        let state = WorkspaceState()
+        state.segments = [TranscriptSegment(start: 0, end: 1, text: "Original words", speakerID: 0)]
+        state.speakerNames = [0: "Casey"]
+        state.summaryText = "Old summary"
+        state.chatMessages = [WorkspaceChatMessage(role: .assistant, text: "Old answer")]
+        state.editSegment(at: 0, text: "Edited words")
+        expect(state.hasUnsavedChanges && state.hasTranscriptContentChanges,
+               "transcript text edit did not mark content as dirty")
+        expect(state.summaryText.isEmpty && state.chatMessages.isEmpty,
+               "transcript text edit left stale summary or chat visible")
+
+        state.hasUnsavedChanges = false
+        state.hasTranscriptContentChanges = false
+        let textBeforeLock = state.segments[0].text
+        state.isSummaryBusy = true
+        state.editSegment(at: 0, text: "Concurrent edit")
+        expect(state.segments[0].text == textBeforeLock && !state.hasUnsavedChanges,
+               "workspace allowed transcript edits while a summary was running")
+        state.isSummaryBusy = false
+        state.toggleFavorite(at: 0)
+        expect(state.hasUnsavedChanges && !state.hasTranscriptContentChanges,
+               "favoriting a segment incorrectly invalidated transcript notes")
     }
 
     static func testInferenceQueue() throws {

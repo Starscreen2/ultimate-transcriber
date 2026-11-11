@@ -1,7 +1,9 @@
 import AppKit
 import AVFoundation
+import SwiftUI
 import UniformTypeIdentifiers
 import Darwin
+import CryptoKit
 
 #if !REGRESSION_TESTS
 @main
@@ -74,11 +76,55 @@ struct WhisperModel: Hashable {
     }
 }
 
-struct TranscriptSegment {
+struct TranscriptSegment: Identifiable, Codable, Equatable {
+    var id: UUID = UUID()
     var start: Double
     var end: Double
     var text: String
     var speakerID: Int?
+    var isFavorite = false
+    var startsNewParagraph = false
+    var isUneven = false
+
+    private enum CodingKeys: String, CodingKey {
+        case id, start, end, text, speakerID, isFavorite, startsNewParagraph, isUneven
+    }
+
+    init(id: UUID = UUID(), start: Double, end: Double, text: String, speakerID: Int?,
+         isFavorite: Bool = false, startsNewParagraph: Bool = false, isUneven: Bool = false) {
+        self.id = id
+        self.start = start
+        self.end = end
+        self.text = text
+        self.speakerID = speakerID
+        self.isFavorite = isFavorite
+        self.startsNewParagraph = startsNewParagraph
+        self.isUneven = isUneven
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
+        start = try container.decode(Double.self, forKey: .start)
+        end = try container.decode(Double.self, forKey: .end)
+        text = try container.decode(String.self, forKey: .text)
+        speakerID = try container.decodeIfPresent(Int.self, forKey: .speakerID)
+        isFavorite = try container.decodeIfPresent(Bool.self, forKey: .isFavorite) ?? false
+        startsNewParagraph = try container.decodeIfPresent(Bool.self, forKey: .startsNewParagraph) ?? false
+        isUneven = try container.decodeIfPresent(Bool.self, forKey: .isUneven) ?? false
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(start, forKey: .start)
+        try container.encode(end, forKey: .end)
+        try container.encode(text, forKey: .text)
+        try container.encodeIfPresent(speakerID, forKey: .speakerID)
+        try container.encode(isFavorite, forKey: .isFavorite)
+        try container.encode(startsNewParagraph, forKey: .startsNewParagraph)
+        try container.encode(isUneven, forKey: .isUneven)
+    }
 }
 
 final class OperationControl: @unchecked Sendable {
@@ -199,6 +245,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
     private let speakerToggle = NSButton(checkboxWithTitle: "Detect speakers", target: nil, action: nil)
     private let speakerEditors = NSStackView()
     private var selectedFile: URL?
+    private let workspaceState = WorkspaceState()
+    private var lastWorkspaceDurationPath: String?
+    private var activeChatOperation: OperationControl?
+    private var activeChatRequestID: UUID?
+    private var selectedLibraryEntryID: UUID?
+    private var transcriptionStartedAt: Date?
+    private var currentTranscriptionSeconds: Double?
     private var resultFolder: URL?
     private var meetingResult: MeetingSessionResult?
     private var summaryURL: URL?
@@ -226,13 +279,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
     private var batchItems: [BatchTranscriptionItem] = []
     private var batchWorks: [UUID: PreemptibleWorkState] = [:]
     private var batchResults: [UUID: BatchTranscriptionResult] = [:]
+    private var batchLibraryEntryIDs: [UUID: UUID] = [:]
     private var batchSettings: BatchTranscriptionSettings?
     private var batchHasStarted = false
     private var activeBatchItemID: UUID?
     private var activeBatchProgress = ""
 
     private var hasActiveSummaryOperation: Bool {
-        activeSummaryOperation != nil || !recoveringSummaryOperations.isEmpty
+        activeSummaryOperation != nil || activeChatOperation != nil || !recoveringSummaryOperations.isEmpty
     }
 
     private enum TranscriptExportFormat: CaseIterable {
@@ -273,6 +327,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
         ActivityCenter.shared.onChange = { [weak self] in
             self?.refreshActivityWindow()
             self?.updateModelDownloadButton()
+            self?.syncWorkspaceState()
         }
         refreshActivityWindow()
         recoverQueuedTranscriptions()
@@ -302,6 +357,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
                 ActivityCenter.shared.update(summaryID, state: .paused, detail: "Paused because the app is closing; it will resume next time")
                 activeSummaryOperation?.cancel()
             }
+            activeChatOperation?.cancel()
             for (summaryID, operation) in recoveringSummaryOperations {
                 ActivityCenter.shared.update(summaryID, state: .paused,
                     detail: "Paused because the app is closing; it will resume next time")
@@ -322,6 +378,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
         } else if activePreemptibleWork == nil {
             activeOperation?.cancel()
         }
+        activeChatOperation?.cancel()
         for (summaryID, operation) in recoveringSummaryOperations {
             ActivityCenter.shared.update(summaryID, state: .paused,
                 detail: "Paused because the app is closing; it will resume next time")
@@ -357,6 +414,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
     private func clearMeetingNotes() {
         summaryURL = nil
         meetingResult = nil
+        workspaceState.summaryText = ""
+        workspaceState.chatMessages = []
+        workspaceState.chatDraft = ""
         summaryButton.isHidden = true
         summaryButton.isEnabled = false
         summaryButton.title = "Generate Local Notes…"
@@ -451,6 +511,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
                 self.outputBase = result.transcriptBase
                 self.transcriptSegments = result.segments
                 self.speakerNames = Dictionary(uniqueKeysWithValues: result.speakerIDs.enumerated().map { ($1, "Speaker \($0 + 1)") })
+                self.selectedFile = result.audioFile
+                self.selectedLibraryEntryID = result.sessionID
                 self.summaryURL = nil
                 self.transcript.string = Self.renderTranscript(result.segments, names: self.speakerNames)
                 self.transcript.textColor = .labelColor
@@ -466,6 +528,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
                 } else {
                     self.status.stringValue = "Meeting saved with \(result.speakerIDs.count) speaker labels."
                 }
+                self.saveLibraryEntry(source: result.audioFile, outputBase: result.transcriptBase,
+                                      folder: result.folder, segments: result.segments,
+                                      names: self.speakerNames, kind: .meeting,
+                                      modelID: "large-v3-turbo", language: "auto",
+                                      id: result.sessionID)
+                self.workspaceState.destination = .transcript
+                self.workspaceState.transcriptMode = .transcript
+                self.workspaceState.hasUnsavedChanges = false
                 self.updateMeetingBadgeMenu()
                 self.updateMeetingCaptureControls()
                 if LocalMeetingSummarizer.isModelInstalled && !self.isTerminating {
@@ -563,7 +633,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
     }
 
     @objc private func startMeetingFromBadge() {
-        guard !meetingInProgress, busyKind != .modelDownload, !isTerminating else { return }
+        guard !meetingInProgress, busyKind != .modelDownload, !hasActiveSummaryOperation, !isTerminating else { return }
         closeDetectionPrompt()
         guard meetingMicrophoneEnabled || (meetingSystemAudioEnabled && supportsSystemAudioCapture) else {
             status.stringValue = "Turn on at least one available audio source in Meeting Settings."
@@ -589,6 +659,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
     }
 
     private func beginMeeting(at folder: URL, detectedMeeting: MeetingEvidence? = nil) {
+        guard !hasActiveSummaryOperation else { return }
+        if workspaceState.hasUnsavedChanges && !commitWorkspaceEdits() { return }
         detectionTracker.claimAll()
         openingTracker.claimAll()
         closeDetectionPrompt()
@@ -901,22 +973,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
                           backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false
         window.title = "Transcribe to Text"
-        window.minSize = NSSize(width: 800, height: 680)
+        window.minSize = NSSize(width: 1040, height: 700)
         window.center()
-
-        filename.font = .boldSystemFont(ofSize: 14)
-        filename.lineBreakMode = .byTruncatingMiddle
-        filePath.font = .systemFont(ofSize: 11)
-        filePath.textColor = .secondaryLabelColor
-        filePath.lineBreakMode = .byTruncatingMiddle
-        status.textColor = .secondaryLabelColor
-        status.lineBreakMode = .byTruncatingTail
 
         WhisperModel.choices.forEach { modelPicker.addItem(withTitle: $0.title) }
         modelPicker.selectItem(at: 7)
         modelDetail.stringValue = WhisperModel.choices[7].detail + " First download is about 1.6 GB."
-        modelDetail.font = .systemFont(ofSize: 11)
-        modelDetail.textColor = .secondaryLabelColor
         ["Auto detect", "English", "Spanish", "French", "German", "Chinese", "Japanese", "Korean", "Other…"]
             .forEach { languagePicker.addItem(withTitle: $0) }
         customLanguage.placeholderString = "Language code (e.g. it)"
@@ -926,61 +988,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
         chooseButton.action = #selector(chooseFile)
         batchButton.target = self
         batchButton.action = #selector(openBatchTranscription)
-        batchButton.bezelStyle = .rounded
         batchButton.toolTip = "Queue several audio or video files for sequential transcription"
         transcribeButton.target = self
         transcribeButton.action = #selector(transcriptionButtonClicked)
-        transcribeButton.bezelStyle = .rounded
-        transcribeButton.keyEquivalent = "\r"
-        transcribeButton.isEnabled = false
         meetingCaptureButton.target = self
         meetingCaptureButton.action = #selector(meetingCaptureButtonClicked)
-        meetingCaptureButton.bezelStyle = .rounded
-        meetingCaptureButton.controlSize = .small
         openRecordingsButton.target = self
         openRecordingsButton.action = #selector(openMeetingRecordings)
-        openRecordingsButton.bezelStyle = .rounded
-        openRecordingsButton.controlSize = .small
         openRecordingsButton.isEnabled = meetingRecordingsFolder != nil
         openRecordingsButton.toolTip = "Open the folder containing all saved meeting sessions"
         activityButton.target = self
         activityButton.action = #selector(openActivity)
-        activityButton.bezelStyle = .rounded
-        activityButton.controlSize = .small
         activityButton.toolTip = "View recordings, transcription, and notes activity"
         meetingSettingsButton.target = self
         meetingSettingsButton.action = #selector(openMeetingSettings)
-        meetingSettingsButton.bezelStyle = .rounded
-        meetingSettingsButton.controlSize = .small
         downloadModelButton.target = self
         downloadModelButton.action = #selector(manageSelectedModel)
-        downloadModelButton.bezelStyle = .rounded
-        downloadModelButton.controlSize = .small
         showResultsButton.target = self
         showResultsButton.action = #selector(showResults)
-        showResultsButton.isHidden = true
         summaryButton.target = self
         summaryButton.action = #selector(generateMeetingNotes)
-        summaryButton.isHidden = true
-        summaryButton.isEnabled = false
-        summaryButton.bezelStyle = .rounded
-        summaryButton.controlSize = .small
         copyTranscriptButton.target = self
         copyTranscriptButton.action = #selector(copyTranscript)
-        copyTranscriptButton.bezelStyle = .rounded
-        copyTranscriptButton.controlSize = .small
         copyTranscriptButton.toolTip = "Copy the transcript with timestamps and speaker names"
         exportTranscriptButton.addItem(withTitle: "Export…")
         TranscriptExportFormat.allCases.forEach { exportTranscriptButton.addItem(withTitle: $0.menuTitle) }
         exportTranscriptButton.selectItem(at: 0)
         exportTranscriptButton.target = self
         exportTranscriptButton.action = #selector(exportTranscript(_:))
-        exportTranscriptButton.controlSize = .small
-        exportTranscriptButton.widthAnchor.constraint(equalToConstant: 92).isActive = true
         exportTranscriptButton.toolTip = "Save the transcript as TXT, SRT, or WebVTT"
-        copyTranscriptButton.isEnabled = false
-        copyTranscriptButton.widthAnchor.constraint(equalToConstant: 112).isActive = true
-        exportTranscriptButton.isEnabled = false
         spinner.style = .spinning
         spinner.controlSize = .small
         spinner.isDisplayedWhenStopped = false
@@ -990,211 +1026,549 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
         languagePicker.action = #selector(languageChanged)
         modelPicker.target = self
         modelPicker.action = #selector(modelChanged)
-        modelChanged()
+        speakerToggle.target = self
+        speakerToggle.action = #selector(speakerDetectionChanged)
+        speakerToggle.state = .on
 
         transcript.isEditable = false
         transcript.isSelectable = true
-        transcript.isVerticallyResizable = true
-        transcript.isHorizontallyResizable = false
-        transcript.autoresizingMask = [.width]
-        transcript.textContainer?.widthTracksTextView = true
-        transcript.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
         transcript.string = "Your transcript will appear here."
-        transcript.textColor = .tertiaryLabelColor
-        transcript.drawsBackground = false
-        let transcriptScroll = NSScrollView()
-        transcriptScroll.documentView = transcript
-        transcriptScroll.hasVerticalScroller = true
-        transcriptScroll.borderType = .bezelBorder
-        transcriptScroll.drawsBackground = false
-        transcriptScroll.autoresizingMask = [.width, .height]
-        transcriptScroll.translatesAutoresizingMaskIntoConstraints = false
 
-        let heading = NSTextField(labelWithString: "Transcribe to Text")
-        heading.font = .boldSystemFont(ofSize: 23)
-        let subheading = NSTextField(labelWithString: "Private, on-device transcription powered by Whisper")
-        subheading.textColor = .secondaryLabelColor
-        subheading.font = .systemFont(ofSize: 13)
-
-        let inputBox = groupBox("Input and settings", content: NSView())
-        let fileCaption = caption("Media file")
-        let modelCaption = caption("Whisper model")
-        let languageCaption = caption("Language")
-        let divider = separator()
-        modelDetail.maximumNumberOfLines = 2
-        modelDetail.lineBreakMode = .byWordWrapping
-        let statusIcon = NSImageView(image: NSImage(systemSymbolName: "info.circle", accessibilityDescription: nil) ?? NSImage())
-        statusIcon.translatesAutoresizingMaskIntoConstraints = false
-        let statusRow = NSView()
-        statusRow.addSubview(statusIcon)
-        statusRow.addSubview(status)
-
-        let previewBox = groupBox("Transcript preview", content: NSView())
-        previewContainer = previewBox
-        let speakerNote = NSTextField(wrappingLabelWithString: "Speaker labels are automatic estimates. Rename them above; TXT, SRT, and VTT update automatically.")
-        speakerNote.textColor = .secondaryLabelColor
-        speakerNote.font = .systemFont(ofSize: 11)
-        speakerNote.maximumNumberOfLines = 2
-        speakerNote.lineBreakMode = .byTruncatingTail
-        let footer = NSTextField(labelWithString: "Exports TXT, SRT, and VTT beside the source file. Media stays on this Mac.")
-        footer.font = .systemFont(ofSize: 11)
-        footer.textColor = .secondaryLabelColor
-        footer.stringValue = "Exports are saved beside the source file."
-        speakerNote.stringValue = "Speaker labels are estimates. Rename them above; exports update automatically."
-
-        window.contentView = NSView()
-        let root = window.contentView!
-        [heading, subheading, inputBox, fileCaption, filename, filePath, chooseButton, batchButton,
-         divider, modelCaption, modelPicker, modelDetail, languageCaption, languagePicker,
-         customLanguage, speakerToggle, transcribeButton, spinner, showResultsButton, statusRow,
-         summaryButton, downloadModelButton, speakerEditors, previewBox, transcriptScroll, speakerNote, footer,
-         meetingCaptureButton, openRecordingsButton, activityButton, meetingSettingsButton, copyTranscriptButton,
-         exportTranscriptButton].forEach { root.addSubview($0) }
-
-        [heading, subheading, inputBox, fileCaption, filename, filePath, chooseButton, batchButton,
-         divider, modelCaption, modelPicker, modelDetail, languageCaption, languagePicker,
-         customLanguage, speakerToggle, transcribeButton, spinner, showResultsButton, statusRow,
-         summaryButton, downloadModelButton, speakerEditors, meetingCaptureButton, openRecordingsButton, activityButton, meetingSettingsButton,
-         statusIcon, status, previewBox, transcriptScroll, speakerNote, footer,
-         copyTranscriptButton, exportTranscriptButton].forEach {
-            $0.translatesAutoresizingMaskIntoConstraints = false
+        let options = WhisperModel.choices.map {
+            WorkspaceModelOption(id: $0.id, title: $0.title.components(separatedBy: " · ").first ?? $0.id,
+                                 detail: $0.detail, downloadSize: $0.downloadSize,
+                                 isInstalled: WhisperModel.isInstalled(at: $0.localURL),
+                                 isEnglishOnly: $0.id.hasSuffix(".en"))
         }
-        inputBox.heightAnchor.constraint(equalToConstant: 250).isActive = true
-        speakerToggle.state = .on
-        speakerToggle.font = .systemFont(ofSize: 12)
-        speakerToggle.toolTip = "Use a separate on-device model to identify who spoke when. Speaker detection adds its own first-run model downloads."
-        speakerEditors.orientation = .horizontal
-        speakerEditors.alignment = .centerY
-        speakerEditors.spacing = 10
-        speakerEditors.isHidden = true
+        workspaceState.modelOptions = options
+        workspaceState.selectedModelID = WhisperModel.choices[7].id
+        workspaceState.history = WorkspaceLibrary.shared.snapshot
+        workspaceState.activities = ActivityCenter.shared.snapshot
+        workspaceState.isSpeakerDetectionEnabled = true
+        modelChanged()
+        syncWorkspaceState()
 
-        NSLayoutConstraint.activate([
-            heading.leftAnchor.constraint(equalTo: root.leftAnchor, constant: 24),
-            heading.topAnchor.constraint(equalTo: root.topAnchor, constant: 18),
-            meetingSettingsButton.rightAnchor.constraint(equalTo: root.rightAnchor, constant: -24),
-            meetingSettingsButton.centerYAnchor.constraint(equalTo: heading.centerYAnchor),
-            activityButton.rightAnchor.constraint(equalTo: meetingSettingsButton.leftAnchor, constant: -8),
-            activityButton.centerYAnchor.constraint(equalTo: heading.centerYAnchor),
-            openRecordingsButton.rightAnchor.constraint(equalTo: activityButton.leftAnchor, constant: -8),
-            openRecordingsButton.centerYAnchor.constraint(equalTo: heading.centerYAnchor),
-            meetingCaptureButton.rightAnchor.constraint(equalTo: openRecordingsButton.leftAnchor, constant: -8),
-            meetingCaptureButton.centerYAnchor.constraint(equalTo: heading.centerYAnchor),
-            subheading.leftAnchor.constraint(equalTo: heading.leftAnchor),
-            subheading.topAnchor.constraint(equalTo: heading.bottomAnchor, constant: 4),
-
-            inputBox.leftAnchor.constraint(equalTo: root.leftAnchor, constant: 24),
-            inputBox.rightAnchor.constraint(equalTo: root.rightAnchor, constant: -24),
-            inputBox.topAnchor.constraint(equalTo: subheading.bottomAnchor, constant: 16),
-
-            fileCaption.leftAnchor.constraint(equalTo: inputBox.leftAnchor, constant: 16),
-            fileCaption.topAnchor.constraint(equalTo: inputBox.topAnchor, constant: 25),
-            filename.leftAnchor.constraint(equalTo: fileCaption.rightAnchor, constant: 12),
-            filename.centerYAnchor.constraint(equalTo: fileCaption.centerYAnchor),
-            filename.rightAnchor.constraint(lessThanOrEqualTo: chooseButton.leftAnchor, constant: -12),
-            chooseButton.widthAnchor.constraint(equalToConstant: 112),
-            chooseButton.rightAnchor.constraint(equalTo: batchButton.leftAnchor, constant: -8),
-            chooseButton.centerYAnchor.constraint(equalTo: fileCaption.centerYAnchor),
-            batchButton.widthAnchor.constraint(equalToConstant: 78),
-            batchButton.rightAnchor.constraint(equalTo: inputBox.rightAnchor, constant: -16),
-            batchButton.centerYAnchor.constraint(equalTo: fileCaption.centerYAnchor),
-            filePath.leftAnchor.constraint(equalTo: fileCaption.leftAnchor),
-            filePath.rightAnchor.constraint(equalTo: batchButton.rightAnchor),
-            filePath.topAnchor.constraint(equalTo: fileCaption.bottomAnchor, constant: 4),
-
-            divider.leftAnchor.constraint(equalTo: fileCaption.leftAnchor),
-            divider.rightAnchor.constraint(equalTo: chooseButton.rightAnchor),
-            divider.topAnchor.constraint(equalTo: filePath.bottomAnchor, constant: 12),
-
-            modelCaption.leftAnchor.constraint(equalTo: fileCaption.leftAnchor),
-            modelCaption.topAnchor.constraint(equalTo: divider.bottomAnchor, constant: 10),
-            modelCaption.rightAnchor.constraint(equalTo: modelPicker.rightAnchor),
-            modelPicker.leftAnchor.constraint(equalTo: modelCaption.leftAnchor),
-            modelPicker.topAnchor.constraint(equalTo: modelCaption.bottomAnchor, constant: 5),
-            modelPicker.widthAnchor.constraint(equalTo: inputBox.widthAnchor, multiplier: 0.55, constant: -20),
-            modelDetail.leftAnchor.constraint(equalTo: modelPicker.leftAnchor),
-            modelDetail.rightAnchor.constraint(equalTo: modelPicker.rightAnchor),
-            modelDetail.topAnchor.constraint(equalTo: modelPicker.bottomAnchor, constant: 4),
-            downloadModelButton.leftAnchor.constraint(equalTo: modelPicker.leftAnchor),
-            downloadModelButton.topAnchor.constraint(equalTo: modelDetail.bottomAnchor, constant: 5),
-
-            languageCaption.leftAnchor.constraint(equalTo: modelPicker.rightAnchor, constant: 22),
-            languageCaption.topAnchor.constraint(equalTo: modelCaption.topAnchor),
-            languageCaption.rightAnchor.constraint(equalTo: chooseButton.rightAnchor),
-            languagePicker.leftAnchor.constraint(equalTo: languageCaption.leftAnchor),
-            languagePicker.rightAnchor.constraint(equalTo: languageCaption.rightAnchor),
-            languagePicker.topAnchor.constraint(equalTo: languageCaption.bottomAnchor, constant: 5),
-            customLanguage.leftAnchor.constraint(equalTo: languagePicker.leftAnchor),
-            customLanguage.rightAnchor.constraint(equalTo: languagePicker.rightAnchor),
-            customLanguage.topAnchor.constraint(equalTo: languagePicker.bottomAnchor, constant: 4),
-
-            speakerToggle.leftAnchor.constraint(equalTo: fileCaption.leftAnchor),
-            speakerToggle.topAnchor.constraint(equalTo: downloadModelButton.bottomAnchor, constant: 8),
-            transcribeButton.rightAnchor.constraint(equalTo: chooseButton.rightAnchor),
-            transcribeButton.widthAnchor.constraint(equalToConstant: 112),
-            transcribeButton.centerYAnchor.constraint(equalTo: speakerToggle.centerYAnchor),
-            speakerToggle.rightAnchor.constraint(lessThanOrEqualTo: spinner.leftAnchor, constant: -8),
-            spinner.rightAnchor.constraint(equalTo: transcribeButton.leftAnchor, constant: -8),
-            spinner.centerYAnchor.constraint(equalTo: speakerToggle.centerYAnchor),
-            showResultsButton.rightAnchor.constraint(equalTo: transcribeButton.leftAnchor, constant: -8),
-            showResultsButton.centerYAnchor.constraint(equalTo: transcribeButton.centerYAnchor),
-            summaryButton.rightAnchor.constraint(equalTo: showResultsButton.leftAnchor, constant: -8),
-            summaryButton.centerYAnchor.constraint(equalTo: transcribeButton.centerYAnchor),
-            transcribeButton.bottomAnchor.constraint(lessThanOrEqualTo: inputBox.bottomAnchor, constant: -14),
-
-            statusRow.leftAnchor.constraint(equalTo: inputBox.leftAnchor),
-            statusRow.rightAnchor.constraint(equalTo: inputBox.rightAnchor),
-            statusRow.topAnchor.constraint(equalTo: inputBox.bottomAnchor, constant: 10),
-            statusRow.heightAnchor.constraint(equalToConstant: 22),
-            statusIcon.leftAnchor.constraint(equalTo: statusRow.leftAnchor),
-            statusIcon.centerYAnchor.constraint(equalTo: statusRow.centerYAnchor),
-            statusIcon.widthAnchor.constraint(equalToConstant: 16),
-            statusIcon.heightAnchor.constraint(equalToConstant: 16),
-            status.leftAnchor.constraint(equalTo: statusIcon.rightAnchor, constant: 8),
-            status.rightAnchor.constraint(equalTo: exportTranscriptButton.leftAnchor, constant: -8),
-            status.centerYAnchor.constraint(equalTo: statusRow.centerYAnchor),
-            copyTranscriptButton.rightAnchor.constraint(equalTo: root.rightAnchor, constant: -24),
-            copyTranscriptButton.centerYAnchor.constraint(equalTo: statusRow.centerYAnchor),
-            exportTranscriptButton.rightAnchor.constraint(equalTo: copyTranscriptButton.leftAnchor, constant: -8),
-            exportTranscriptButton.centerYAnchor.constraint(equalTo: copyTranscriptButton.centerYAnchor),
-
-            previewBox.leftAnchor.constraint(equalTo: root.leftAnchor, constant: 24),
-            previewBox.rightAnchor.constraint(equalTo: root.rightAnchor, constant: -24),
-            previewBox.topAnchor.constraint(equalTo: statusRow.bottomAnchor, constant: 8),
-            previewBox.bottomAnchor.constraint(equalTo: speakerNote.topAnchor, constant: -10),
-            transcriptScroll.leftAnchor.constraint(equalTo: previewBox.leftAnchor, constant: 16),
-            transcriptScroll.rightAnchor.constraint(equalTo: previewBox.rightAnchor, constant: -16),
-            transcriptScroll.bottomAnchor.constraint(equalTo: previewBox.bottomAnchor, constant: -12),
-            speakerEditors.leftAnchor.constraint(equalTo: previewBox.leftAnchor, constant: 16),
-            speakerEditors.rightAnchor.constraint(lessThanOrEqualTo: previewBox.rightAnchor, constant: -16),
-            speakerEditors.topAnchor.constraint(equalTo: previewBox.topAnchor, constant: 26),
-            previewBox.heightAnchor.constraint(greaterThanOrEqualToConstant: 220),
-
-            speakerNote.leftAnchor.constraint(equalTo: root.leftAnchor, constant: 24),
-            speakerNote.rightAnchor.constraint(equalTo: root.rightAnchor, constant: -24),
-            speakerNote.bottomAnchor.constraint(equalTo: footer.topAnchor, constant: -4),
-            footer.leftAnchor.constraint(equalTo: root.leftAnchor, constant: 24),
-            footer.rightAnchor.constraint(equalTo: root.rightAnchor, constant: -24),
-            footer.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -12),
-        ])
-        let transcriptTopWithoutSpeakers = transcriptScroll.topAnchor.constraint(equalTo: previewBox.topAnchor, constant: 28)
-        transcriptTopConstraint = transcriptTopWithoutSpeakers
-        transcriptTopWithoutSpeakers.isActive = true
-        speakerToggle.target = self
-        speakerToggle.action = #selector(speakerDetectionChanged)
+        let host = NSHostingView(rootView: WorkspaceView(state: workspaceState, actions: makeWorkspaceActions()))
+        host.translatesAutoresizingMaskIntoConstraints = false
+        window.contentView = host
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+
+    }
+
+    private func makeWorkspaceActions() -> WorkspaceActions {
+        var actions = WorkspaceActions()
+        actions.refresh = { [weak self] in self?.syncWorkspaceState() }
+        actions.openFile = { [weak self] in self?.chooseFile() }
+        actions.openBatch = { [weak self] in self?.openBatchTranscription() }
+        actions.transcribe = { [weak self] in self?.transcriptionButtonClicked() }
+        actions.toggleMeeting = { [weak self] in self?.meetingCaptureButtonClicked() }
+        actions.openRecordings = { [weak self] in self?.openMeetingRecordings() }
+        actions.openActivity = { [weak self] in self?.openActivity() }
+        actions.openMeetingSettings = { [weak self] in self?.openMeetingSettings() }
+        actions.manageModel = { [weak self] in self?.manageSelectedModel() }
+        actions.selectModel = { [weak self] id in self?.selectWorkspaceModel(id) }
+        actions.selectLanguage = { [weak self] id in self?.selectWorkspaceLanguage(id) }
+        actions.setSpeakerDetection = { [weak self] enabled in
+            guard let self else { return }
+            self.speakerToggle.state = enabled ? .on : .off
+            self.speakerDetectionChanged()
+            self.syncWorkspaceState()
+        }
+        actions.copyTranscript = { [weak self] in
+            guard let self else { return }
+            guard self.commitWorkspaceEdits() else { return }
+            self.copyTranscript()
+        }
+        actions.exportTranscript = { [weak self] format in
+            guard let self else { return }
+            guard self.commitWorkspaceEdits() else { return }
+            self.exportWorkspace(format: format)
+        }
+        actions.commitEdits = { [weak self] in self?.commitWorkspaceEdits() }
+        actions.openTranscript = { [weak self] id in self?.openLibraryEntry(id) }
+        actions.softDeleteTranscript = { [weak self] id in self?.softDeleteLibraryEntry(id) }
+        actions.restoreTranscript = { [weak self] id in self?.restoreLibraryEntry(id) }
+        actions.permanentlyDeleteTranscript = { [weak self] id in self?.permanentlyDeleteLibraryEntry(id) }
+        actions.dismissActivity = { id in
+            guard let item = ActivityCenter.shared.snapshot.first(where: { $0.id == id }),
+                  item.state == .completed || item.state == .failed || item.state == .cancelled else { return }
+            ActivityCenter.shared.remove(id)
+        }
+        actions.clearCompletedActivity = { ActivityCenter.shared.removeFinished() }
+        actions.openFolder = { path in NSWorkspace.shared.open(URL(fileURLWithPath: path, isDirectory: true)) }
+        actions.generateSummary = { [weak self] in self?.startWorkspaceSummary() }
+        actions.submitChat = { [weak self] question in self?.startWorkspaceChat(question: question) }
+        actions.openResults = { [weak self] in
+            guard let self else { return }
+            if let folder = self.resultFolder { NSWorkspace.shared.open(folder) }
+            else if let entry = self.workspaceState.selectedEntry { NSWorkspace.shared.open(entry.folderURL) }
+        }
+        return actions
+    }
+
+    private func syncWorkspaceState() {
+        let state = workspaceState
+        let currentStatus = status.stringValue
+        if state.status != currentStatus { state.status = currentStatus }
+        let currentName = selectedFile?.lastPathComponent ?? "No media selected"
+        if state.currentFileName != currentName { state.currentFileName = currentName }
+        let currentPath = selectedFile?.path
+        if state.sourcePath != currentPath { state.sourcePath = currentPath }
+        let modelIndex = min(max(modelPicker.indexOfSelectedItem, 0), WhisperModel.choices.count - 1)
+        let selectedModel = WhisperModel.choices[modelIndex]
+        if state.selectedModelID != selectedModel.id { state.selectedModelID = selectedModel.id }
+        let modelOptions = WhisperModel.choices.map {
+            WorkspaceModelOption(id: $0.id, title: $0.title.components(separatedBy: " · ").first ?? $0.id,
+                                 detail: $0.detail, downloadSize: $0.downloadSize,
+                                 isInstalled: WhisperModel.isInstalled(at: $0.localURL),
+                                 isEnglishOnly: $0.id.hasSuffix(".en"))
+        }
+        if state.modelOptions != modelOptions { state.modelOptions = modelOptions }
+        let languageIDs = ["auto", "en", "es", "fr", "de", "zh", "ja", "ko", "other"]
+        let languageIndex = min(max(languagePicker.indexOfSelectedItem, 0), languageIDs.count - 1)
+        let languageID = languageIndex == 8 && !customLanguage.stringValue.isEmpty
+            ? customLanguage.stringValue.lowercased() : languageIDs[languageIndex]
+        if state.selectedLanguage != languageID { state.selectedLanguage = languageID }
+        let busy = isBusy || busyKind == .modelDownload
+        if state.isBusy != busy { state.isBusy = busy }
+        let downloadingModel = busyKind == .modelDownload
+        if state.isDownloadingModel != downloadingModel { state.isDownloadingModel = downloadingModel }
+        let transcribing = busyKind == .transcription
+        if state.isTranscribing != transcribing { state.isTranscribing = transcribing }
+        if state.isMeeting != meetingInProgress { state.isMeeting = meetingInProgress }
+        let speakerEnabled = speakerToggle.state == .on
+        if state.isSpeakerDetectionEnabled != speakerEnabled { state.isSpeakerDetectionEnabled = speakerEnabled }
+        let summaryBusy = activeSummaryOperation != nil || !recoveringSummaryOperations.isEmpty
+        if state.isSummaryBusy != summaryBusy { state.isSummaryBusy = summaryBusy }
+        if state.isChatBusy != (activeChatOperation != nil) { state.isChatBusy = activeChatOperation != nil }
+        if state.transcriptionSeconds != currentTranscriptionSeconds { state.transcriptionSeconds = currentTranscriptionSeconds }
+        if !state.hasUnsavedChanges {
+            if state.segments != transcriptSegments { state.segments = transcriptSegments }
+            if state.speakerNames != speakerNames { state.speakerNames = speakerNames }
+        }
+        if state.activities != ActivityCenter.shared.snapshot { state.activities = ActivityCenter.shared.snapshot }
+        let libraryEntries = WorkspaceLibrary.shared.snapshot
+        if state.history != libraryEntries { state.history = libraryEntries }
+        let libraryWarning = WorkspaceLibrary.shared.loadError
+        if state.libraryWarning != libraryWarning { state.libraryWarning = libraryWarning }
+        if state.activeHistoryID != selectedLibraryEntryID { state.activeHistoryID = selectedLibraryEntryID }
+        if let selectedFile, lastWorkspaceDurationPath != selectedFile.path {
+            lastWorkspaceDurationPath = selectedFile.path
+            if state.duration != 0 { state.duration = 0 }
+            let path = selectedFile.path
+            loadAssetDuration(selectedFile) { [weak self] duration in
+                guard let self, self.selectedFile?.path == path else { return }
+                self.workspaceState.duration = duration
+            }
+        } else if selectedFile == nil {
+            lastWorkspaceDurationPath = nil
+            if state.duration != 0 { state.duration = 0 }
+        }
+    }
+
+    private func selectWorkspaceModel(_ id: String) {
+        guard !isBusy, !meetingInProgress, !isTerminating else { return }
+        guard let index = WhisperModel.choices.firstIndex(where: { $0.id == id }) else { return }
+        modelPicker.selectItem(at: index)
+        modelChanged()
+        syncWorkspaceState()
+    }
+
+    private func selectWorkspaceLanguage(_ id: String) {
+        guard !isBusy, !meetingInProgress, !isTerminating else { return }
+        let ids = ["auto", "en", "es", "fr", "de", "zh", "ja", "ko"]
+        if let index = ids.firstIndex(of: id) {
+            languagePicker.selectItem(at: index)
+            customLanguage.stringValue = ""
+        } else {
+            languagePicker.selectItem(at: 8)
+            customLanguage.stringValue = id
+        }
+        languageChanged()
+        syncWorkspaceState()
+    }
+
+    @discardableResult
+    private func commitWorkspaceEdits() -> Bool {
+        guard workspaceState.hasUnsavedChanges else { return true }
+        let contentChanged = workspaceState.hasTranscriptContentChanges
+        transcriptSegments = workspaceState.segments
+        speakerNames = workspaceState.speakerNames
+        transcript.string = Self.renderTranscript(transcriptSegments, names: speakerNames)
+        transcript.textColor = .labelColor
+        updateSpeakerEditors()
+        if let outputBase {
+            do {
+                try Self.writeExports(base: outputBase, segments: transcriptSegments, names: speakerNames)
+            } catch {
+                status.stringValue = "Changes are visible, but the TXT, SRT, and WebVTT exports could not be updated: \(error.localizedDescription)"
+                syncWorkspaceState()
+                return false
+            }
+        }
+        if let id = selectedLibraryEntryID,
+           var entry = WorkspaceLibrary.shared.snapshot.first(where: { $0.id == id }) {
+            entry.segments = transcriptSegments
+            entry.speakerNames = speakerNames
+            if contentChanged { entry.summaryTranscriptDigest = nil }
+            entry.updatedAt = Date()
+            do { try WorkspaceLibrary.shared.save(entry) }
+            catch {
+                status.stringValue = "Transcript changed, but the library could not be saved: \(error.localizedDescription)"
+                syncWorkspaceState()
+                return false
+            }
+        }
+        if contentChanged, let outputBase {
+            let oldSummary = URL(fileURLWithPath: outputBase.path + ".summary.md")
+            try? FileManager.default.removeItem(at: oldSummary)
+        }
+        if contentChanged { workspaceState.summaryText = "" }
+        workspaceState.hasTranscriptContentChanges = false
+        workspaceState.hasUnsavedChanges = false
+        status.stringValue = "Transcript changes saved."
+        syncWorkspaceState()
+        return true
+    }
+
+    private func loadAssetDuration(_ url: URL, completion: @escaping (Double) -> Void) {
+        let asset = AVURLAsset(url: url)
+        Task {
+            let value: Double
+            do { value = try await asset.load(.duration).seconds }
+            catch { value = 0 }
+            let duration = value.isFinite && value > 0 ? value : 0
+            await MainActor.run { completion(duration) }
+        }
+    }
+
+    @discardableResult
+    private func saveLibraryEntry(source: URL, outputBase: URL, folder: URL,
+                                  segments: [TranscriptSegment], names: [Int: String],
+                                  kind: WorkspaceRecordKind, modelID: String, language: String,
+                                  duration: Double? = nil, id: UUID? = nil) -> UUID {
+        let now = Date()
+        let existing = WorkspaceLibrary.shared.snapshot.first {
+            !$0.isDeleted && $0.sourcePath == source.path && $0.kind == kind
+        }
+        let entryID = existing?.id ?? id ?? UUID()
+        let entry = WorkspaceLibraryEntry(
+            id: entryID,
+            title: source.lastPathComponent,
+            sourcePath: source.path,
+            outputBasePath: outputBase.path,
+            folderPath: folder.path,
+            modelID: modelID,
+            language: language,
+            duration: duration.flatMap { $0.isFinite && $0 > 0 ? $0 : nil } ?? 0,
+            createdAt: existing?.createdAt ?? now,
+            updatedAt: now,
+            kind: kind,
+            segments: segments,
+            speakerNames: names,
+            isDeleted: false)
+        do {
+            try WorkspaceLibrary.shared.save(entry)
+            selectedLibraryEntryID = entry.id
+            workspaceState.activeHistoryID = entry.id
+            workspaceState.history = WorkspaceLibrary.shared.snapshot
+            if entry.duration == 0 {
+                loadAssetDuration(source) { [weak self] duration in
+                    guard duration > 0 else { return }
+                    do {
+                        try WorkspaceLibrary.shared.update(entry.id) { $0.duration = duration }
+                        self?.syncWorkspaceState()
+                    } catch {
+                        NSLog("Could not update the saved transcript duration: %@", error.localizedDescription)
+                    }
+                }
+            }
+            return entry.id
+        } catch {
+            status.stringValue = "Transcript completed, but the library entry could not be saved: \(error.localizedDescription)"
+            return entry.id
+        }
+    }
+
+    private func openLibraryEntry(_ id: UUID) {
+        guard let entry = WorkspaceLibrary.shared.snapshot.first(where: { $0.id == id && !$0.isDeleted }) else { return }
+        if workspaceState.hasUnsavedChanges && !commitWorkspaceEdits() { return }
+        clearMeetingNotes()
+        let savedSummary = URL(fileURLWithPath: entry.outputBasePath + ".summary.md")
+        let digestMatches = entry.summaryTranscriptDigest == Self.transcriptDigest(entry.segments, names: entry.speakerNames)
+        let legacySummaryIsNewer: Bool = {
+            guard entry.summaryTranscriptDigest == nil,
+                  let attributes = try? FileManager.default.attributesOfItem(atPath: savedSummary.path),
+                  let modified = attributes[.modificationDate] as? Date else { return false }
+            return modified > entry.updatedAt
+        }()
+        if digestMatches || legacySummaryIsNewer {
+            workspaceState.summaryText = (try? String(contentsOf: savedSummary, encoding: .utf8)) ?? ""
+        }
+        selectedFile = entry.sourceURL
+        selectedLibraryEntryID = entry.id
+        filename.stringValue = entry.title
+        filePath.stringValue = entry.sourcePath
+        transcriptSegments = entry.segments
+        speakerNames = entry.speakerNames
+        outputBase = entry.outputBaseURL
+        resultFolder = entry.folderURL
+        transcript.string = Self.renderTranscript(entry.segments, names: entry.speakerNames)
+        transcript.textColor = .labelColor
+        workspaceState.destination = .transcript
+        workspaceState.transcriptMode = .transcript
+        workspaceState.hasUnsavedChanges = false
+        workspaceState.hasTranscriptContentChanges = false
+        workspaceState.activeHistoryID = entry.id
+        selectWorkspaceModel(entry.modelID)
+        selectWorkspaceLanguage(entry.language)
+        updateSpeakerEditors()
+        updateTranscriptActionButtons()
+        showResultsButton.isHidden = false
+        status.stringValue = FileManager.default.fileExists(atPath: entry.sourcePath)
+            ? "Opened from your local library."
+            : "Transcript opened. Its original media file is no longer at the saved path."
+        syncWorkspaceState()
+    }
+
+    private func softDeleteLibraryEntry(_ id: UUID) {
+        if workspaceState.activeHistoryID == id,
+           workspaceState.hasUnsavedChanges,
+           !commitWorkspaceEdits() { return }
+        do {
+            try WorkspaceLibrary.shared.delete(id)
+            if selectedLibraryEntryID == id {
+                selectedLibraryEntryID = nil
+                workspaceState.activeHistoryID = nil
+                workspaceState.destination = .recentlyDeleted
+            }
+            workspaceState.history = WorkspaceLibrary.shared.snapshot
+            status.stringValue = "Moved transcript to Recently Deleted. Source media was left in place."
+        } catch { status.stringValue = "Could not update the transcript library: \(error.localizedDescription)" }
+        syncWorkspaceState()
+    }
+
+    private func restoreLibraryEntry(_ id: UUID) {
+        do { try WorkspaceLibrary.shared.restore(id) }
+        catch { status.stringValue = "Could not restore the transcript: \(error.localizedDescription)" }
+        syncWorkspaceState()
+    }
+
+    private func permanentlyDeleteLibraryEntry(_ id: UUID) {
+        do { try WorkspaceLibrary.shared.permanentlyDelete(id) }
+        catch { status.stringValue = "Could not permanently remove the transcript: \(error.localizedDescription)" }
+        if selectedLibraryEntryID == id { selectedLibraryEntryID = nil }
+        syncWorkspaceState()
+    }
+
+    private func exportWorkspace(format: String) {
+        guard !transcriptSegments.isEmpty else { return }
+        if format == "whisper" {
+            exportWhisperArchive()
+            return
+        }
+        let menuTitle: String
+        switch format {
+        case "srt": menuTitle = TranscriptExportFormat.srt.menuTitle
+        case "vtt": menuTitle = TranscriptExportFormat.vtt.menuTitle
+        default: menuTitle = TranscriptExportFormat.plainText.menuTitle
+        }
+        exportTranscriptButton.selectItem(withTitle: menuTitle)
+        exportTranscript(exportTranscriptButton)
+    }
+
+    private func exportWhisperArchive() {
+        guard let source = selectedFile, !transcriptSegments.isEmpty else { return }
+        let panel = NSSavePanel()
+        panel.title = "Export Whisper Archive"
+        panel.prompt = "Export"
+        panel.canCreateDirectories = true
+        panel.allowedContentTypes = [UTType(filenameExtension: "whisper") ?? .data]
+        panel.nameFieldStringValue = "\(source.deletingPathExtension().lastPathComponent).whisper"
+        guard panel.runModal() == .OK, let destination = panel.url else { return }
+        let settings = selectedTranscriptionSettings()
+        do {
+            try WhisperArchive.export(source: source, segments: transcriptSegments, names: speakerNames,
+                                      modelID: settings.model.id, language: settings.language,
+                                      to: destination)
+            status.stringValue = "Whisper archive exported as \(destination.lastPathComponent)."
+        } catch {
+            status.stringValue = "Whisper archive export failed: \(error.localizedDescription)"
+        }
+        syncWorkspaceState()
+    }
+
+    private func importWhisperArchive(_ archiveURL: URL) {
+        if workspaceState.hasUnsavedChanges && !commitWorkspaceEdits() { return }
+        do {
+            let imported = try WhisperArchive.import(archive: archiveURL)
+            clearMeetingNotes()
+            selectedFile = imported.mediaURL
+            selectedLibraryEntryID = nil
+            filename.stringValue = imported.title
+            filePath.stringValue = archiveURL.path
+            transcriptSegments = imported.segments
+            speakerNames = imported.speakerNames
+            let importedOutputBase = imported.mediaURL.deletingPathExtension()
+            outputBase = importedOutputBase
+            resultFolder = imported.mediaURL.deletingLastPathComponent()
+            transcript.string = Self.renderTranscript(imported.segments, names: imported.speakerNames)
+            transcript.textColor = .labelColor
+            currentTranscriptionSeconds = nil
+            workspaceState.hasUnsavedChanges = false
+            workspaceState.hasTranscriptContentChanges = false
+            workspaceState.destination = .transcript
+            workspaceState.transcriptMode = .transcript
+            workspaceState.chatMessages = []
+            if let index = WhisperModel.choices.firstIndex(where: { $0.id == imported.modelID }) {
+                modelPicker.selectItem(at: index)
+                modelChanged()
+            }
+            selectWorkspaceLanguage(imported.language)
+            updateSpeakerEditors()
+            updateTranscriptActionButtons()
+            showResultsButton.isHidden = false
+            status.stringValue = "Imported versioned Whisper archive. Its media was extracted into your local application-support folder."
+            saveLibraryEntry(source: imported.mediaURL, outputBase: importedOutputBase,
+                             folder: imported.mediaURL.deletingLastPathComponent(),
+                             segments: imported.segments, names: imported.speakerNames,
+                             kind: .transcription, modelID: imported.modelID, language: imported.language)
+            syncWorkspaceState()
+        } catch {
+            status.stringValue = "Whisper archive import failed: \(error.localizedDescription)"
+            syncWorkspaceState()
+        }
+    }
+
+    private func startWorkspaceSummary() {
+        guard !transcriptSegments.isEmpty, activeSummaryOperation == nil,
+              activeChatOperation == nil, !isBusy, !meetingInProgress else { return }
+        if workspaceState.hasUnsavedChanges && !commitWorkspaceEdits() { return }
+        let generationID = UUID()
+        let operation = OperationControl()
+        let folder = resultFolder ?? outputBase?.deletingLastPathComponent()
+            ?? selectedFile?.deletingLastPathComponent()
+            ?? FileManager.default.temporaryDirectory
+        let summaryDestination = outputBase.map { URL(fileURLWithPath: $0.path + ".summary.md") }
+            ?? folder.appendingPathComponent("summary.md")
+        let title = selectedFile?.lastPathComponent ?? folder.lastPathComponent
+        let sourcePath = selectedFile?.path
+        let historyID = selectedLibraryEntryID
+        ActivityCenter.shared.add(kind: .summary, title: title, state: .running,
+                                  detail: "Generating local transcript notes", folderURL: folder,
+                                  outputBaseURL: outputBase, id: generationID)
+        summaryGenerationID = generationID
+        activeSummaryOperation = operation
+        workspaceState.summaryText = ""
+        status.stringValue = "Preparing local notes…"
+        updateModelDownloadButton()
+        syncWorkspaceState()
+        let currentSegments = transcriptSegments
+        let currentNames = speakerNames
+        LocalMeetingSummarizer.generate(folder: folder, segments: currentSegments, names: currentNames,
+                                        outputURL: summaryDestination,
+                                        control: operation,
+                                        progress: { [weak self] message in
+            DispatchQueue.main.async {
+                guard let self, self.summaryGenerationID == generationID else { return }
+                self.status.stringValue = message
+                self.workspaceState.status = message
+            }
+        }, completion: { [weak self] completion in
+            guard let self, self.summaryGenerationID == generationID else { return }
+            self.activeSummaryOperation = nil
+            self.updateModelDownloadButton()
+            switch completion {
+            case .success(let url):
+                self.summaryURL = url
+                if self.selectedFile?.path == sourcePath {
+                    self.workspaceState.summaryText = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+                }
+                if let historyID, self.selectedLibraryEntryID == historyID, self.selectedFile?.path == sourcePath {
+                    let digest = Self.transcriptDigest(currentSegments, names: currentNames)
+                    do {
+                        try WorkspaceLibrary.shared.update(historyID) { $0.summaryTranscriptDigest = digest }
+                    } catch {
+                        NSLog("Could not record the transcript version for its local summary: %@", error.localizedDescription)
+                    }
+                }
+                self.status.stringValue = "Local notes saved as \(url.lastPathComponent)."
+                ActivityCenter.shared.update(generationID, state: .completed, detail: "Local notes saved")
+            case .failure(let error):
+                let pausedForQuit = self.isTerminating && operation.isCancelled
+                let detail = pausedForQuit ? "Paused because the app is closing; it will resume next time" : error.localizedDescription
+                self.status.stringValue = pausedForQuit ? detail : "Local summary failed: \(error.localizedDescription)"
+                ActivityCenter.shared.update(generationID, state: pausedForQuit ? .paused : .failed, detail: detail)
+            }
+            self.syncWorkspaceState()
+            self.tryReplyToTermination()
+        })
+    }
+
+    private func startWorkspaceChat(question: String) {
+        let cleanQuestion = question.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanQuestion.isEmpty, !transcriptSegments.isEmpty,
+              activeChatOperation == nil, activeSummaryOperation == nil, !isBusy else { return }
+        if workspaceState.hasUnsavedChanges && !commitWorkspaceEdits() { return }
+        let requestID = UUID()
+        let operation = OperationControl()
+        let sourcePath = selectedFile?.path
+        activeChatRequestID = requestID
+        activeChatOperation = operation
+        status.stringValue = "Preparing local transcript chat…"
+        updateModelDownloadButton()
+        syncWorkspaceState()
+        let currentSegments = transcriptSegments
+        let currentNames = speakerNames
+        LocalMeetingSummarizer.answer(question: cleanQuestion, segments: currentSegments, names: currentNames,
+                                      control: operation,
+                                      progress: { [weak self] message in
+            DispatchQueue.main.async {
+                guard let self, self.activeChatRequestID == requestID else { return }
+                self.status.stringValue = message
+                self.workspaceState.status = message
+            }
+        }, completion: { [weak self] result in
+            guard let self, self.activeChatRequestID == requestID else { return }
+            self.activeChatOperation = nil
+            self.activeChatRequestID = nil
+            self.updateModelDownloadButton()
+            switch result {
+            case .success(let answer):
+                if self.selectedFile?.path == sourcePath {
+                    self.workspaceState.chatMessages.append(WorkspaceChatMessage(role: .assistant, text: answer))
+                }
+                self.status.stringValue = "Local answer ready."
+            case .failure(let error):
+                let pausedForQuit = self.isTerminating && operation.isCancelled
+                let message = pausedForQuit ? "Chat paused because the app is closing." : "I could not answer from this transcript: \(error.localizedDescription)"
+                if self.selectedFile?.path == sourcePath {
+                    self.workspaceState.chatMessages.append(WorkspaceChatMessage(role: .assistant, text: message))
+                }
+                self.status.stringValue = message
+            }
+            self.syncWorkspaceState()
+            self.tryReplyToTermination()
+        })
     }
 
     @objc private func chooseFile() {
-        guard !isBusy, !meetingInProgress, !isTerminating else { return }
+        guard !isBusy, !hasActiveSummaryOperation, !meetingInProgress, !isTerminating else { return }
         let panel = NSOpenPanel()
         panel.canChooseFiles = true
         panel.canChooseDirectories = false
         panel.allowsMultipleSelection = false
         panel.allowedContentTypes = [.item]
         if panel.runModal() == .OK, let url = panel.url {
+            if url.pathExtension.lowercased() == "whisper" {
+                importWhisperArchive(url)
+                return
+            }
+            if workspaceState.hasUnsavedChanges && !commitWorkspaceEdits() { return }
             clearMeetingNotes()
             selectedFile = url
+            selectedLibraryEntryID = nil
             transcribeButton.isEnabled = true
             filename.stringValue = url.lastPathComponent
             filePath.stringValue = url.path
@@ -1207,6 +1581,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
             resultFolder = nil
             showResultsButton.isHidden = true
             status.stringValue = "Ready to transcribe."
+            currentTranscriptionSeconds = nil
+            workspaceState.hasUnsavedChanges = false
+            workspaceState.hasTranscriptContentChanges = false
+            workspaceState.destination = .home
+            workspaceState.transcriptMode = .transcript
+            workspaceState.chatMessages = []
             updateTranscriptActionButtons()
             updateMeetingBadgeMenu()
         }
@@ -1586,8 +1966,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
 
         for item in center.recoverableItems() {
             if item.kind == .summary {
-                guard let folder = item.folderURL,
-                      let data = try? Data(contentsOf: folder.appendingPathComponent("transcript.srt")),
+                guard let folder = item.folderURL else { continue }
+                let transcriptURL = item.outputBasePath.map { URL(fileURLWithPath: $0 + ".srt") }
+                    ?? folder.appendingPathComponent("transcript.srt")
+                let summaryURL = item.outputBasePath.map { URL(fileURLWithPath: $0 + ".summary.md") }
+                    ?? folder.appendingPathComponent("summary.md")
+                guard let data = try? Data(contentsOf: transcriptURL),
                       let text = String(data: data, encoding: .utf8) else { continue }
                 let segments = Self.parseSRT(text)
                 guard !segments.isEmpty else { center.update(item.id, state: .failed, detail: "Saved transcript could not be read"); continue }
@@ -1595,7 +1979,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
                 recoveringSummaryOperations[item.id] = control
                 center.update(item.id, state: .running, detail: "Resuming meeting notes")
                 updateModelDownloadButton()
-                LocalMeetingSummarizer.generate(folder: folder, segments: segments, names: [:], control: control,
+                LocalMeetingSummarizer.generate(folder: folder, segments: segments, names: [:], outputURL: summaryURL, control: control,
                     progress: { _ in }, completion: { result in
                         DispatchQueue.main.async {
                             self.recoveringSummaryOperations.removeValue(forKey: item.id)
@@ -1648,7 +2032,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
     }
 
     @objc private func openBatchTranscription() {
-        guard !meetingInProgress, !isTerminating else { return }
+        guard !meetingInProgress, !hasActiveSummaryOperation, !isTerminating else { return }
         let panel = makeBatchPanelIfNeeded()
         updateBatchPanel()
         panel.show()
@@ -1701,11 +2085,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
     }
 
     private func startBatchTranscription() {
-        guard !batchHasStarted, !batchItems.isEmpty, !isBusy, !meetingInProgress, !isTerminating else { return }
+        guard !batchHasStarted, !batchItems.isEmpty, !isBusy, !hasActiveSummaryOperation,
+              !meetingInProgress, !isTerminating else { return }
+        if workspaceState.hasUnsavedChanges && !commitWorkspaceEdits() { return }
         clearMeetingNotes()
         batchHasStarted = true
         batchSettings = selectedTranscriptionSettings()
         batchResults.removeAll()
+        batchLibraryEntryIDs.removeAll()
         batchWorks.removeAll()
         isBusy = true
         busyKind = .batchTranscription
@@ -1848,6 +2235,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
         batchItems[index].detail = result.speakerWarning.map { "Saved · \($0)" }
             ?? "Saved TXT, SRT, and WebVTT"
         ActivityCenter.shared.update(id, state: .completed, detail: "Transcript saved")
+        let batchItem = batchItems[index]
+        let names = Dictionary(uniqueKeysWithValues: result.speakerIDs.enumerated().map { ($1, "Speaker \($0 + 1)") })
+        let settings = batchSettings ?? selectedTranscriptionSettings()
+        batchLibraryEntryIDs[id] = saveLibraryEntry(
+            source: batchItem.sourceURL, outputBase: result.base, folder: result.folder,
+            segments: result.segments, names: names, kind: .transcription,
+            modelID: settings.model.id, language: settings.language, id: id)
         clearActiveBatchItem(id)
         status.stringValue = "Finished \(batchItems[index].sourceURL.lastPathComponent). " + BatchTranscriptionPlan.summary(for: batchItems)
         updateBatchPanel()
@@ -1932,7 +2326,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
 
     private func showBatchResult(for id: UUID) {
         guard let result = batchResults[id] else { return }
+        if workspaceState.hasUnsavedChanges && !commitWorkspaceEdits() { return }
         clearMeetingNotes()
+        selectedFile = batchItems.first(where: { $0.id == id })?.sourceURL
+        selectedLibraryEntryID = batchLibraryEntryIDs[id] ?? id
         transcriptSegments = result.segments
         speakerNames = Dictionary(uniqueKeysWithValues: result.speakerIDs.enumerated().map { ($1, "Speaker \($0 + 1)") })
         outputBase = result.base
@@ -1942,6 +2339,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
         updateSpeakerEditors()
         updateTranscriptActionButtons()
         showResultsButton.isHidden = false
+        workspaceState.destination = .transcript
+        workspaceState.transcriptMode = .transcript
+        workspaceState.hasUnsavedChanges = false
+        workspaceState.hasTranscriptContentChanges = false
+        workspaceState.chatMessages = []
         status.stringValue = "Showing transcript for \(batchItems.first(where: { $0.id == id })?.sourceURL.lastPathComponent ?? "file")."
     }
 
@@ -1969,8 +2371,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
     }
 
     private func startTranscription() {
-        guard let file = selectedFile, activeOperation == nil, !meetingInProgress, !isTerminating else { return }
+        guard let file = selectedFile, activeOperation == nil, !hasActiveSummaryOperation,
+              !meetingInProgress, !isTerminating else { return }
+        if workspaceState.hasUnsavedChanges && !commitWorkspaceEdits() { return }
         clearMeetingNotes()
+        selectedLibraryEntryID = nil
+        workspaceState.hasUnsavedChanges = false
+        workspaceState.hasTranscriptContentChanges = false
+        workspaceState.destination = .transcript
+        workspaceState.transcriptMode = .transcript
+        workspaceState.chatMessages = []
+        transcriptionStartedAt = Date()
+        currentTranscriptionSeconds = nil
         resultFolder = nil
         showResultsButton.isHidden = true
         let taskID = UUID()
@@ -2053,6 +2465,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
                         } else {
                             self.status.stringValue = "Done. Saved TXT, SRT, and VTT next to the source file."
                         }
+                        self.currentTranscriptionSeconds = self.transcriptionStartedAt.map { Date().timeIntervalSince($0) }
+                        self.transcriptionStartedAt = nil
+                        self.saveLibraryEntry(source: file, outputBase: result.base, folder: result.folder,
+                                              segments: result.segments, names: self.speakerNames,
+                                              kind: .transcription, modelID: model.id, language: lang,
+                                              id: taskID)
                     }
                     self.finishBusy()
                 }
@@ -2350,6 +2768,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate {
             let label = speaker.map { "  \($0):" } ?? ""
             return "[\(timeString(segment.start, separator: ".").prefix(8))]\(label)  \(segment.text)"
         }.joined(separator: "\n\n")
+    }
+
+    private struct SummaryDigestLine: Encodable {
+        let start: Double
+        let end: Double
+        let text: String
+        let speaker: String?
+    }
+
+    private static func transcriptDigest(_ segments: [TranscriptSegment], names: [Int: String]) -> String {
+        let source = segments.map { segment in
+            SummaryDigestLine(start: segment.start, end: segment.end, text: segment.text,
+                              speaker: segment.speakerID.flatMap { names[$0] })
+        }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        guard let data = try? encoder.encode(source) else { return "" }
+        return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
 
     static func writeExports(base: URL, segments: [TranscriptSegment], names: [Int: String],
