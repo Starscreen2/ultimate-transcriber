@@ -2,6 +2,8 @@
 
 This is the separate Windows version of Transcribe to Text. Windows source, native build scripts, and packaging inputs live under `windows/`; the macOS app and its build remain at the repository root. The Windows client is not included in the current GitHub release yet.
 
+For future Codex work on this client, see the scoped [AGENTS.md](AGENTS.md) instructions and the [architecture guide](ARCHITECTURE.md).
+
 ## Current capabilities
 
 | Capability | Windows implementation |
