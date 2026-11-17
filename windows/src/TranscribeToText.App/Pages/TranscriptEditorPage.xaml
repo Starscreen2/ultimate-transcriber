@@ -1,0 +1,71 @@
+<Page
+    x:Class="TranscribeToText.Windows.Pages.TranscriptEditorPage"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:local="using:TranscribeToText.Windows.Pages">
+    <Grid Padding="28" RowSpacing="14">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+        </Grid.RowDefinitions>
+        <Grid ColumnSpacing="10">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="Auto" />
+            </Grid.ColumnDefinitions>
+            <Button Content="Back" Click="Back_Click" />
+            <TextBlock x:Name="TitleText" Grid.Column="1" VerticalAlignment="Center"
+                       Style="{StaticResource TitleTextBlockStyle}" TextTrimming="CharacterEllipsis" />
+            <Button Grid.Column="2" Content="Move to Recently Deleted" Click="Delete_Click" />
+            <Button Grid.Column="3" Content="Local notes…" Click="Notes_Click" />
+            <Button Grid.Column="4" Content="Export .whisper…" Click="ExportArchive_Click" />
+            <Button Grid.Column="5" Content="Save transcript" Click="Save_Click" />
+        </Grid>
+        <TextBlock x:Name="StatusText" Grid.Row="1" Text="Edit segment text; timestamps remain attached." Opacity="0.72" />
+        <StackPanel Grid.Row="2" Spacing="6">
+            <TextBlock Text="Speaker names" FontWeight="SemiBold" />
+            <ItemsControl x:Name="SpeakersList">
+                <ItemsControl.ItemsPanel>
+                    <ItemsPanelTemplate>
+                        <ItemsStackPanel Orientation="Horizontal" />
+                    </ItemsPanelTemplate>
+                </ItemsControl.ItemsPanel>
+                <ItemsControl.ItemTemplate>
+                    <DataTemplate x:DataType="local:SpeakerEditorRow">
+                        <StackPanel Orientation="Horizontal" Spacing="8" Margin="0,0,16,0">
+                            <TextBlock Text="{x:Bind Label}" VerticalAlignment="Center" />
+                            <TextBox Text="{x:Bind Name, Mode=TwoWay}" Width="150" />
+                        </StackPanel>
+                    </DataTemplate>
+                </ItemsControl.ItemTemplate>
+            </ItemsControl>
+        </StackPanel>
+        <MediaPlayerElement x:Name="MediaElement" Grid.Row="3" AreTransportControlsEnabled="True"
+                            MaxHeight="120" />
+        <ListView x:Name="SegmentsList" Grid.Row="4" SelectionMode="None">
+            <ListView.ItemTemplate>
+                <DataTemplate x:DataType="local:SegmentEditorRow">
+                    <Grid Padding="8" ColumnSpacing="12">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="110" />
+                            <ColumnDefinition Width="110" />
+                            <ColumnDefinition Width="120" />
+                            <ColumnDefinition Width="*" />
+                        </Grid.ColumnDefinitions>
+                        <TextBlock Text="{x:Bind TimeLabel}" VerticalAlignment="Top" Opacity="0.72" />
+                        <TextBlock Grid.Column="1" Text="{x:Bind SpeakerLabel}" VerticalAlignment="Top" Opacity="0.72" />
+                        <TextBox Grid.Column="2" Text="{x:Bind Text, Mode=TwoWay}" AcceptsReturn="True"
+                                 TextWrapping="Wrap" MinHeight="42" />
+                    </Grid>
+                </DataTemplate>
+            </ListView.ItemTemplate>
+        </ListView>
+    </Grid>
+</Page>

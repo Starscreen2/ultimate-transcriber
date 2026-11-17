@@ -1,0 +1,89 @@
+<Page
+    x:Class="TranscribeToText.Windows.Pages.MeetingPage"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:models="using:TranscribeToText.Core.Models">
+    <Grid Padding="30" RowSpacing="18">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+        </Grid.RowDefinitions>
+        <StackPanel Spacing="5">
+            <TextBlock Text="Meetings" Style="{StaticResource TitleTextBlockStyle}" />
+            <TextBlock Text="Record microphone and/or system audio, then create a local transcript." Opacity="0.72" />
+        </StackPanel>
+        <Border Grid.Row="1" Padding="18" CornerRadius="8" Background="{ThemeResource CardBackgroundFillColorDefaultBrush}">
+            <Grid ColumnSpacing="18">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+                <StackPanel Spacing="10">
+                    <StackPanel Orientation="Horizontal" Spacing="14">
+                        <CheckBox x:Name="MicrophoneCheckBox" Content="Microphone" IsChecked="True" />
+                        <CheckBox x:Name="SystemAudioCheckBox" Content="System audio" IsChecked="True" />
+                        <CheckBox x:Name="DetectSpeakersCheckBox" Content="Detect speakers" />
+                    </StackPanel>
+                    <StackPanel Orientation="Horizontal" Spacing="10">
+                        <TextBlock Text="Whisper model" VerticalAlignment="Center" />
+                        <ComboBox x:Name="ModelPicker" DisplayMemberPath="Name" MinWidth="250" />
+                        <TextBlock Text="Language" VerticalAlignment="Center" />
+                        <ComboBox x:Name="LanguagePicker" SelectedIndex="0" MinWidth="140">
+                            <ComboBoxItem Content="Auto detect" Tag="auto" />
+                            <ComboBoxItem Content="English" Tag="en" />
+                            <ComboBoxItem Content="Spanish" Tag="es" />
+                            <ComboBoxItem Content="French" Tag="fr" />
+                            <ComboBoxItem Content="German" Tag="de" />
+                            <ComboBoxItem Content="Chinese" Tag="zh" />
+                            <ComboBoxItem Content="Japanese" Tag="ja" />
+                            <ComboBoxItem Content="Korean" Tag="ko" />
+                        </ComboBox>
+                        <TextBox x:Name="LanguageCodeBox" PlaceholderText="Other code" Width="120" />
+                        <TextBlock x:Name="LanguageModeHint" TextWrapping="Wrap" Opacity="0.7" />
+                    </StackPanel>
+                    <StackPanel Orientation="Horizontal" Spacing="10" VerticalAlignment="Center">
+                        <ProgressRing x:Name="BusyIndicator" Width="18" Height="18" IsActive="False" />
+                        <TextBlock x:Name="StatusText" Text="Ready to record." VerticalAlignment="Center" TextWrapping="Wrap" />
+                    </StackPanel>
+                </StackPanel>
+                <Button x:Name="StartButton" Grid.Column="1" Content="Start recording" VerticalAlignment="Center" Click="Start_Click" />
+                <Button x:Name="StopButton" Grid.Column="2" Content="Stop &amp; transcribe" VerticalAlignment="Center" Click="Stop_Click" IsEnabled="False" />
+            </Grid>
+        </Border>
+        <Grid Grid.Row="2" RowSpacing="10">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="*" />
+            </Grid.RowDefinitions>
+            <Grid ColumnSpacing="10">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+                <TextBlock Text="Recent meetings" Style="{StaticResource SubtitleTextBlockStyle}" />
+                <Button Grid.Column="1" Content="Open recordings folder" Click="OpenRecordings_Click" />
+            </Grid>
+            <ListView x:Name="MeetingsList" Grid.Row="1" IsItemClickEnabled="True" ItemClick="Meeting_ItemClick">
+                <ListView.ItemTemplate>
+                    <DataTemplate x:DataType="models:WorkspaceLibraryEntry">
+                        <Grid Padding="9" ColumnSpacing="14">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+                            <StackPanel Spacing="4">
+                                <TextBlock Text="{x:Bind Title}" FontWeight="SemiBold" />
+                                <TextBlock Text="{x:Bind ModelId}" Opacity="0.68" />
+                            </StackPanel>
+                            <TextBlock Grid.Column="1" Text="{x:Bind DurationLabel}" VerticalAlignment="Center" />
+                            <Button Grid.Column="2" Content="Open" Tag="{x:Bind Id}" Click="OpenMeeting_Click" />
+                        </Grid>
+                    </DataTemplate>
+                </ListView.ItemTemplate>
+            </ListView>
+        </Grid>
+    </Grid>
+</Page>

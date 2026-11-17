@@ -2,6 +2,8 @@
 
 An Apple Silicon Mac app for local audio and video transcription, speaker labels, and meeting notes. Audio, transcripts, and summaries stay on your Mac.
 
+The repository also contains a separate native Windows client under [`windows/`](windows/README.md). It is in development and will join the same GitHub releases after Windows builds and AMD/NVIDIA hardware are validated; the current release remains macOS-only.
+
 ## Build
 
 Requires macOS 13+, Xcode Command Line Tools, CMake, Git, Python 3, and FFmpeg (`brew install ffmpeg`). Run:

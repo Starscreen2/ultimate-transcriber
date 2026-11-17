@@ -14,9 +14,22 @@ Ultimate Transcriber uses or can download software and model files maintained by
 
 The upstream license texts and ONNX Runtime third-party notices are included in `ThirdPartyLicenses/` and copied into the app bundle by `build-app.sh`.
 
+## Software built into the Windows client
+
+| Component | License | Source |
+| --- | --- | --- |
+| whisper.cpp | MIT | <https://github.com/ggml-org/whisper.cpp> |
+| llama.cpp | MIT | <https://github.com/ggml-org/llama.cpp> |
+| sherpa-onnx | Apache-2.0 | <https://github.com/k2-fsa/sherpa-onnx> |
+| NAudio | MIT | <https://github.com/naudio/NAudio> |
+
+NAudio's MIT notice is included in `ThirdPartyLicenses/NAudio.txt`. Windows engine builds may include the upstream dependencies listed for the Mac build above; their notices remain in those native source trees and should accompany packaged releases.
+
 ## Software installed separately
 
 FFmpeg is used for media conversion when available on the user's Mac; it is not bundled by this project. Install it separately with Homebrew (`brew install ffmpeg`). FFmpeg builds can use different configurations and licenses; consult the license information for the specific FFmpeg build you install.
+
+The Windows engine build script requires a Windows FFmpeg executable and copies it into the local engine folder. FFmpeg is supplied by the developer or release packager, not downloaded by this project; include the applicable license and notices when redistributing it.
 
 ## Models downloaded by the app
 

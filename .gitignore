@@ -1,6 +1,13 @@
 .DS_Store
 /build/
 /vendor/
+/windows/.cache/
+/windows/build/
+/windows/runtime/
+/windows/artifacts/
+/windows/**/bin/
+/windows/**/obj/
+/reconstruction/
 __pycache__/
 
 # Local release artifacts and generated media

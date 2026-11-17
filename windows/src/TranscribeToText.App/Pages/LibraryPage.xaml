@@ -1,0 +1,47 @@
+<Page
+    x:Class="TranscribeToText.Windows.Pages.LibraryPage"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:models="using:TranscribeToText.Core.Models">
+    <Grid Padding="32" RowSpacing="18">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+        </Grid.RowDefinitions>
+        <Grid ColumnSpacing="12">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="Auto" />
+            </Grid.ColumnDefinitions>
+            <TextBlock x:Name="Heading" Text="Transcriptions" Style="{StaticResource TitleTextBlockStyle}" />
+            <Button x:Name="ClearRecentlyDeletedButton" Grid.Column="1" Content="Clear Recently Deleted"
+                    Click="ClearRecentlyDeleted_Click" Visibility="Collapsed" />
+        </Grid>
+        <TextBlock x:Name="StatusText" Grid.Row="1" Text="Saved transcripts stay on this PC." Opacity="0.72" />
+        <ListView x:Name="EntriesList" Grid.Row="2" IsItemClickEnabled="True" ItemClick="Entry_ItemClick">
+            <ListView.ItemTemplate>
+                <DataTemplate x:DataType="models:WorkspaceLibraryEntry">
+                    <Grid Padding="10" ColumnSpacing="16">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="Auto" />
+                            <ColumnDefinition Width="Auto" />
+                            <ColumnDefinition Width="Auto" />
+                        </Grid.ColumnDefinitions>
+                        <StackPanel Spacing="4" VerticalAlignment="Center">
+                            <TextBlock Text="{x:Bind Title}" FontWeight="SemiBold" />
+                            <TextBlock Text="{x:Bind SourcePath}" Opacity="0.68"
+                                       TextTrimming="CharacterEllipsis" />
+                            <TextBlock Text="{x:Bind ModelId}" Opacity="0.68" />
+                        </StackPanel>
+                        <Button Grid.Column="1" Content="Open" Tag="{x:Bind Id}" Click="OpenEntry_Click" />
+                        <Button Grid.Column="2" Content="{x:Bind LibraryAction}" Tag="{x:Bind Id}" Click="DeleteEntry_Click" />
+                        <Button Grid.Column="3" Content="Delete forever" Tag="{x:Bind Id}"
+                                IsEnabled="{x:Bind IsDeleted}" Click="DeleteForever_Click" />
+                    </Grid>
+                </DataTemplate>
+            </ListView.ItemTemplate>
+        </ListView>
+    </Grid>
+</Page>
