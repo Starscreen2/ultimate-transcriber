@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://starscreen2.github.io/ultimate-transcriber/sitemap.xml
