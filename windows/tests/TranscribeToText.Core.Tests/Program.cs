@@ -69,7 +69,8 @@ static Task TestTranscriptFormatting()
     Assert(Math.Abs(parsed[0].Start - 1.25) < 0.0001, "First start time changed.");
     Assert(parsed[1].Text == "Second line.", "Segment text changed.");
     Assert(TranscriptExportService.ToSrt(parsed).Contains("00:00:01,250 --> 00:00:02,500", StringComparison.Ordinal), "SRT timestamp is incorrect.");
-    Assert(TranscriptExportService.ToWebVtt(parsed).StartsWith("WEBVTT\n\n", StringComparison.Ordinal), "VTT header is missing.");
+    var webVtt = TranscriptExportService.ToWebVtt(parsed).Replace("\r\n", "\n", StringComparison.Ordinal);
+    Assert(webVtt.StartsWith("WEBVTT\n\n", StringComparison.Ordinal), "VTT header is missing.");
     return Task.CompletedTask;
 }
 
