@@ -69,7 +69,7 @@
                 <Button x:Name="OpenOutputButton" Content="Open output folder" Click="OpenOutput_Click" IsEnabled="False" />
             </StackPanel>
             <TextBox x:Name="TranscriptBox" Grid.Row="1" AcceptsReturn="True" IsReadOnly="True"
-                     TextWrapping="Wrap" VerticalScrollBarVisibility="Auto"
+                     TextWrapping="Wrap" ScrollViewer.VerticalScrollBarVisibility="Auto"
                      PlaceholderText="Transcript text will appear here." />
         </Grid>
     </Grid>
