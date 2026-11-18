@@ -63,21 +63,22 @@ public sealed class ModelDownloadService(HttpClient? httpClient = null)
 
             var totalBytes = response.Content.Headers.ContentLength;
             await using var input = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
-            await using var output = new FileStream(
-                temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None,
-                bufferSize: 1024 * 128, FileOptions.Asynchronous | FileOptions.SequentialScan);
-
             var buffer = new byte[1024 * 128];
             long received = 0;
             int count;
-            while ((count = await input.ReadAsync(buffer, cancellationToken).ConfigureAwait(false)) > 0)
+            await using (var output = new FileStream(
+                temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None,
+                bufferSize: 1024 * 128, FileOptions.Asynchronous | FileOptions.SequentialScan))
             {
-                await output.WriteAsync(buffer.AsMemory(0, count), cancellationToken).ConfigureAwait(false);
-                received += count;
-                progress?.Report(new DownloadProgress(received, totalBytes));
+                while ((count = await input.ReadAsync(buffer, cancellationToken).ConfigureAwait(false)) > 0)
+                {
+                    await output.WriteAsync(buffer.AsMemory(0, count), cancellationToken).ConfigureAwait(false);
+                    received += count;
+                    progress?.Report(new DownloadProgress(received, totalBytes));
+                }
+                await output.FlushAsync(cancellationToken).ConfigureAwait(false);
+                output.Flush(flushToDisk: true);
             }
-            await output.FlushAsync(cancellationToken).ConfigureAwait(false);
-            output.Flush(flushToDisk: true);
 
             ValidateDownloadedFile(model, temporary);
             File.Move(temporary, destination, overwrite: true);

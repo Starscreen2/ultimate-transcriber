@@ -19,7 +19,7 @@ For future Codex work on this client, see the scoped [AGENTS.md](AGENTS.md) inst
 | Meeting reminders | Optional best-effort visible-window reminders for Zoom, Teams, and Google Meet; recording only starts after a manual click |
 | Hardware backends | CPU baseline; optional CUDA build for NVIDIA and Vulkan build for AMD and supported NVIDIA GPUs; Auto tries available backends then CPU |
 
-The first implementation is complete enough for a Windows build and hardware smoke-test pass, but is not release-ready. WinUI, native engine packaging, real recording and transcription, archives created by the Mac app, and representative AMD/NVIDIA GPUs still need validation on Windows. Meeting-window detection is deliberately limited to visible window titles and process names; it does not start recording automatically or reproduce the Mac app's deeper call-control detection.
+The first implementation is complete enough for a Windows build and hardware smoke-test pass, but is not a fully validated release. A CPU-only preview is attached to the v0.4.0 GitHub release and was built from the `codex/windows-client` branch. WinUI, native engine packaging, real recording and transcription, archives created by the Mac app, and representative AMD/NVIDIA GPUs still need validation on Windows. Meeting-window detection is deliberately limited to visible window titles and process names; it does not start recording automatically or reproduce the Mac app's deeper call-control detection.
 
 ## Build and run on Windows
 
@@ -45,13 +45,15 @@ dotnet build windows\src\TranscribeToText.App\TranscribeToText.App.csproj -c Rel
 dotnet run --project windows\src\TranscribeToText.App\TranscribeToText.App.csproj -c Release -p:Platform=x64
 ```
 
-To create a portable Windows x64 ZIP after building the CPU engine, pass the license notice for the FFmpeg build you supplied. If a CUDA engine is present, also pass its applicable redistribution license/notice:
+To create a self-contained Windows x64 EXE and a ZIP with the EXE and third-party notices, pass the license and README for the FFmpeg build you supplied. If a CUDA engine is present, also pass its applicable redistribution license/notice:
 
 ```powershell
-.\windows\scripts\publish-windows.ps1 -Version v0.5.0 -FfmpegLicensePath C:\ffmpeg\LICENSE.txt
+.\windows\scripts\publish-windows.ps1 -Version v0.5.0 -FfmpegLicensePath C:\ffmpeg\LICENSE.txt -FfmpegReadmePath C:\ffmpeg\README.txt
 ```
 
-For a bundle that contains CUDA runtime DLLs, add `-CudaLicensePath` with the applicable NVIDIA notice. The ZIP is written under ignored `windows/artifacts/`; it includes the self-contained app, engine backends present in `windows/runtime/engines/`, and third-party license files. A Windows release can use the same version tag as macOS and attach this ZIP to the existing GitHub release after Windows builds and hardware validation pass.
+For a bundle that contains CUDA runtime DLLs, add `-CudaLicensePath` with the applicable NVIDIA notice. The script writes `TranscribeToText.App.exe` and a versioned companion ZIP under ignored `windows/artifacts/`. The EXE is a single-file, self-contained app with the engine backends present in `windows/runtime/engines/`; a Windows user does not need to install .NET, CMake, Git, or FFmpeg. Keep the EXE's filename when downloading it because WinUI uses the compiled app name at startup. The ZIP contains the same EXE plus third-party license files, the supplied FFmpeg build README, and the MSVC redistributable notice. The app downloads selected models on first use, so internet access is needed for that initial download; transcription runs locally after the models are available.
+
+The v0.4.0 release includes the current Windows CPU-only preview EXE and companion ZIP; these are not a claim that the full Windows checklist in [VALIDATION.md](VALIDATION.md) has passed. Attach a validated Windows build to the matching release after the checklist is complete, and do not replace the macOS release asset.
 
 Run the portable core checks with:
 

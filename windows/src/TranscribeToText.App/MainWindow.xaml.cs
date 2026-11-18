@@ -17,6 +17,7 @@ public sealed partial class MainWindow : Window
     public MainWindow()
     {
         InitializeComponent();
+        SetWindowIcon();
         Closed += MainWindow_Closed;
         RootNavigation.SelectedItem = RootNavigation.MenuItems[0];
         ContentFrame.Navigate(typeof(HomePage));
@@ -24,6 +25,23 @@ public sealed partial class MainWindow : Window
         _meetingTimer.Interval = TimeSpan.FromSeconds(5);
         _meetingTimer.Tick += MeetingTimer_Tick;
         _meetingTimer.Start();
+    }
+
+    private void SetWindowIcon()
+    {
+        const string resourceName = "TranscribeToText.Windows.Assets.AppIcon.ico";
+        using var iconStream = typeof(MainWindow).Assembly.GetManifestResourceStream(resourceName)
+            ?? throw new InvalidOperationException($"The embedded app icon '{resourceName}' was not found.");
+
+        var iconDirectory = Path.Combine(Path.GetTempPath(), "UltimateTranscriber");
+        Directory.CreateDirectory(iconDirectory);
+        var iconPath = Path.Combine(iconDirectory, $"AppIcon-{Environment.ProcessId}.ico");
+        using (var destination = File.Create(iconPath))
+        {
+            iconStream.CopyTo(destination);
+        }
+
+        AppWindow.SetIcon(iconPath);
     }
 
     private void OnNavigationChanged(NavigationView sender, NavigationViewSelectionChangedEventArgs args)

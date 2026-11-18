@@ -22,6 +22,7 @@ The upstream license texts and ONNX Runtime third-party notices are included in 
 | llama.cpp | MIT | <https://github.com/ggml-org/llama.cpp> |
 | sherpa-onnx | Apache-2.0 | <https://github.com/k2-fsa/sherpa-onnx> |
 | NAudio | MIT | <https://github.com/naudio/NAudio> |
+| MSVC OpenMP runtime (`vcomp140.dll`) | Microsoft Visual Studio redistributable terms | <https://aka.ms/vs/17/redist.txt> |
 
 NAudio's MIT notice is included in `ThirdPartyLicenses/NAudio.txt`. Windows engine builds may include the upstream dependencies listed for the Mac build above; their notices remain in those native source trees and should accompany packaged releases.
 

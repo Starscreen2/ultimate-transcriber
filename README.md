@@ -2,7 +2,7 @@
 
 An Apple Silicon Mac app for local audio and video transcription, speaker labels, and meeting notes. Audio, transcripts, and summaries stay on your Mac.
 
-The repository also contains a separate native Windows client under [`windows/`](windows/README.md). It is in development and will join the same GitHub releases after Windows builds and AMD/NVIDIA hardware are validated; the current release remains macOS-only.
+The repository also contains a separate native Windows client under [`windows/`](windows/README.md). A CPU-only Windows preview is attached to the v0.4.0 GitHub release. It remains in development; meeting capture, archive interoperability, and GPU paths still need validation. See the [Windows validation checklist](windows/VALIDATION.md) before treating it as a supported release.
 
 ## Build
 

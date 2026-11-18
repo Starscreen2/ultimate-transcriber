@@ -140,7 +140,12 @@ $LlamaBuild = Join-Path $BuildRoot "llama-$($Backend.ToLowerInvariant())"
 $LlamaFlags = $CommonCMakeFlags + @(
     "-DLLAMA_BUILD_TESTS=OFF",
     "-DLLAMA_BUILD_EXAMPLES=ON",
-    "-DLLAMA_BUILD_SERVER=OFF",
+    # llama-cli is currently added under this option in the pinned llama.cpp revision.
+    "-DLLAMA_BUILD_SERVER=ON",
+    "-DLLAMA_BUILD_APP=OFF",
+    "-DLLAMA_BUILD_UI=OFF",
+    "-DLLAMA_USE_PREBUILT_UI=OFF",
+    "-DCMAKE_CXX_FLAGS=/DNOMINMAX",
     "-DLLAMA_OPENSSL=OFF"
 )
 Invoke-External "cmake" (@("-S", $LlamaSource, "-B", $LlamaBuild) + $LlamaFlags)
@@ -177,6 +182,26 @@ foreach ($engine in @(
     Copy-ExecutableAndAdjacentDlls -ExecutablePath $executablePath -DestinationDirectory $RuntimeRoot
 }
 
+# whisper.cpp and llama.cpp use MSVC OpenMP. Bundle its app-local runtime so
+# CPU engines do not depend on the Visual C++ runtime being preinstalled.
+$vswherePath = Join-Path ([Environment]::GetFolderPath('ProgramFilesX86')) "Microsoft Visual Studio\Installer\vswhere.exe"
+if (-not (Test-Path -LiteralPath $vswherePath -PathType Leaf)) {
+    throw "Visual Studio's vswhere.exe was not found. Install Visual Studio with the Desktop development with C++ workload."
+}
+$vsInstallPaths = @(& $vswherePath -latest -products "*" -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath)
+if ($LASTEXITCODE -ne 0 -or $vsInstallPaths.Count -eq 0) {
+    throw "Could not locate the Visual Studio C++ toolset needed to bundle vcomp140.dll."
+}
+$vcRedistRoot = Join-Path $vsInstallPaths[0] "VC\Redist\MSVC"
+$vcompRuntime = Get-ChildItem -LiteralPath $vcRedistRoot -Filter "vcomp140.dll" -File -Recurse -ErrorAction SilentlyContinue |
+    Where-Object { $_.FullName -match '\\x64\\Microsoft\.VC143\.OpenMP\\vcomp140\.dll$' } |
+    Sort-Object { [version]$_.Directory.Parent.Parent.Name } -Descending |
+    Select-Object -First 1
+if ($null -eq $vcompRuntime) {
+    throw "Could not find the x64 MSVC OpenMP redistributable vcomp140.dll under $vcRedistRoot."
+}
+Copy-Item -LiteralPath $vcompRuntime.FullName -Destination $RuntimeRoot -Force
+
 if ([string]::IsNullOrWhiteSpace($FfmpegPath)) {
     $ffmpegCommand = Get-Command "ffmpeg.exe" -ErrorAction SilentlyContinue
     if ($null -ne $ffmpegCommand) { $FfmpegPath = $ffmpegCommand.Source }
@@ -211,6 +236,7 @@ $manifest = [ordered]@{
     llamaCppRevision = $PinnedRepositories[1].Revision
     sherpaOnnxRevision = $PinnedRepositories[2].Revision
     ffmpegBundled = $true
+    vcOpenMpRuntimeBundled = $true
     generatedAtUtc = [DateTime]::UtcNow.ToString("O")
 }
 $manifest | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $RuntimeRoot "engines.json") -Encoding utf8
